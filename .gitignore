@@ -209,3 +209,4 @@ detections
 outputs
 results
 trackeval
+*.ipynb

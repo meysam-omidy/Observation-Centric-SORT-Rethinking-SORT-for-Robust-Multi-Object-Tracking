@@ -41,16 +41,17 @@ def assignment(cost_matrix, threshold):
     if cost_matrix.size == 0:
         return np.empty((0, 2), dtype=int), tuple(range(cost_matrix.shape[0])), tuple(range(cost_matrix.shape[1]))
     matches, unmatched_a, unmatched_b = [], [], []
-    cost, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=threshold)
+    cost, x, y = lap.lapjv(cost_matrix, extend_cost=True)
+    # cost, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=threshold)
     for ix, mx in enumerate(x):
         if mx >= 0:
             matches.append([ix, mx])
     unmatched_a = np.where(x < 0)[0]
     unmatched_b = np.where(y < 0)[0]
     matches = np.asarray(matches)
-    return matches, unmatched_a, unmatched_b
+    return matches.tolist(), unmatched_a.tolist(), unmatched_b.tolist()
 
-def associate(tracks, detections, threshold, iou_weight=0.8):
+def associate(tracks, detections, threshold, speed_direction_weight=0):
     if len(tracks) == 0:
         return [], [], [i for i in range(len(detections))]
     elif len(detections) == 0:
@@ -60,13 +61,23 @@ def associate(tracks, detections, threshold, iou_weight=0.8):
     track_tlbrs = np.array([t.tlbr for t in tracks])
     track_previous_obs = np.array([t.k_last_observation for t in tracks])
     speed_directions = batch_speed_direction(track_previous_obs, detections)
-    speed_directions_cost = np.abs(speed_directions - track_speed_directions) / (2 * np.pi)
+    speed_directions_cost = np.abs(speed_directions - track_speed_directions) / np.pi
+    # speed_directions_cost /= speed_directions_cost.max()
     iou_cost = 1 - batch_iou(track_tlbrs, detections)
     mask = (track_previous_obs == [0,0,1,1]).all(axis=1).repeat(len(detections)).reshape(-1, len(detections))
-    iou_weight_matrix = np.ones_like(iou_cost) * iou_weight
-    iou_weight_matrix = np.where(mask, np.ones_like(iou_cost), iou_weight_matrix )
-    cost = iou_weight_matrix * iou_cost + (1 - iou_weight_matrix) * speed_directions_cost
+    speed_direction_weight_matrix = np.ones_like(speed_directions_cost) * speed_direction_weight
+    speed_direction_weight_matrix = np.where(mask, np.zeros_like(speed_directions_cost), speed_direction_weight_matrix)
+    # print(iou_weight_matrix)
+    cost = iou_cost + speed_direction_weight_matrix * speed_directions_cost
     matched_tracks, unmatched_tracks, unmatched_detections = assignment(cost, 1 - threshold)
+    matchs_to_remove = []
+    for i, j in matched_tracks:
+        if 1 - iou_cost[i,j] <= threshold:
+            matchs_to_remove.append([i,j])
+            unmatched_tracks.append(i)
+            unmatched_detections.append(j)
+    for i,j in matchs_to_remove:
+        matched_tracks.remove([i,j])
     return matched_tracks, unmatched_tracks, unmatched_detections
     
 def select_indices(arr, indices):

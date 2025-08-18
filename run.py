@@ -9,8 +9,8 @@ from utils import count_time
 
 @count_time
 def run():
-    seqs = ['MOT17-05-FRCNN', ]
-    # seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
+    # seqs = ['MOT17-05-FRCNN', ]
+    seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
 
 
     os.makedirs('outputs/ocsort-self', exist_ok=True)
@@ -34,7 +34,7 @@ def run():
             tracker.update(dets)
             for track in Track.get_tracks([STATE_TRACKING]):
                 file.write(f'{track.mot_format}\n')
-            # if frame_number == 100:
+            # if frame_number == 10:
             #     break
         file.close()
     seqmap.close()
