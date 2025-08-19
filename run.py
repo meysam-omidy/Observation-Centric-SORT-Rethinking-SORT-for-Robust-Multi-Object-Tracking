@@ -9,7 +9,7 @@ from utils import count_time
 
 @count_time
 def run():
-    # seqs = ['MOT17-05-FRCNN', ]
+    # seqs = ['MOT17-02-FRCNN', ]
     seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
 
 
@@ -26,7 +26,7 @@ def run():
         gt_dets_file = np.loadtxt(f'../../.Datasets/MOT17/train/{seq}/gt/gt.txt', delimiter=',')
 
         # cbiou = CBIOUTracker()
-        tracker = OCSORTTracker()
+        tracker = OCSORTTracker({})
 
         for i,frame_number in enumerate(np.unique(gt_dets_file[:,0])):
             # gt_dets, dets = gt_dets_file[gt_dets_file[:,0] == frame_number][:, 1:6], detections[int(frame_number)][:, :5]
