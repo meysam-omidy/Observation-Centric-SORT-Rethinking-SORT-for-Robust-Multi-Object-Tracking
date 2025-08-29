@@ -208,5 +208,7 @@ __marimo__/
 detections
 outputs
 results
+ablations
+ablation_results
 trackeval
 *.ipynb

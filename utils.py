@@ -42,6 +42,7 @@ def assignment(cost_matrix):
         return np.empty((0, 2), dtype=int), tuple(range(cost_matrix.shape[0])), tuple(range(cost_matrix.shape[1]))
     matches, unmatched_a, unmatched_b = [], [], []
     cost, x, y = lap.lapjv(cost_matrix, extend_cost=True)
+    # cost, x, y = lap.lapjv(cost_matrix, extend_cost=True)
     for ix, mx in enumerate(x):
         if mx >= 0:
             matches.append([ix, mx])
@@ -50,7 +51,7 @@ def assignment(cost_matrix):
     matches = np.asarray(matches)
     return matches.tolist(), unmatched_a.tolist(), unmatched_b.tolist()
 
-def associate(tracks, detections, iou_threshold, iou_coefficient, speed_direction_coefficient):
+def associate(tracks, detections, scores, iou_threshold, iou_coefficient, speed_direction_coefficient, with_print=False):
     if len(tracks) == 0:
         return [], [], [i for i in range(len(detections))]
     elif len(detections) == 0:
@@ -63,6 +64,8 @@ def associate(tracks, detections, iou_threshold, iou_coefficient, speed_directio
     speed_directions = batch_speed_direction(track_previous_obs, detections)
     speed_directions_cost = np.abs(speed_directions - track_speed_directions)
     speed_directions_cost = np.where(speed_directions_cost > np.pi, 2 * np.pi - speed_directions_cost, speed_directions_cost) / np.pi
+    scores_matrix = np.array(scores).reshape(1, -1).repeat(len(tracks), axis=0)
+    speed_directions_cost *= scores_matrix
     mask = (track_previous_obs == [0,0,1,1]).all(axis=1).repeat(len(detections)).reshape(-1, len(detections))
     speed_direction_coefficient_matrix = np.ones_like(speed_directions_cost) * speed_direction_coefficient
     speed_direction_coefficient_matrix = np.where(mask, np.zeros_like(speed_directions_cost), speed_direction_coefficient_matrix)
@@ -78,6 +81,20 @@ def associate(tracks, detections, iou_threshold, iou_coefficient, speed_directio
             unmatched_detections.append(j)
     for i,j in matchs_to_remove:
         matched_tracks.remove([i,j])
+    if with_print:
+        print('tracks', track_tlbrs)
+        print('track ids', [t.id for t in tracks])
+        print('track_speed_directions', track_speed_directions)
+        print('detections', detections)
+        print('scores_matrix', scores_matrix)
+        print('iou', 1 - iou_cost)
+        print('speed_directions_cost', speed_directions_cost)
+        print('matrix', speed_direction_coefficient_matrix)
+        print('cost', cost)
+        print('matchs_to_remove', matchs_to_remove)
+        print('matched_tracks', matched_tracks)
+        print('unmatched_tracks', unmatched_tracks)
+        print('unmatched_detections', unmatched_detections)
     return matched_tracks, unmatched_tracks, unmatched_detections
     
 def select_indices(arr, indices):

@@ -1,8 +1,8 @@
 import numpy as np
 import textwrap
 from track_state import STATE_UNCONFIRMED, STATE_TRACKING, STATE_LOST, STATE_DELETED, TrackState
-from utils import z_to_tlwh, z_to_tlbr, z_to_xywh, tlbr_to_z, tlbr_to_tlwh, count_time
-from kalman_filter import KalmanFilter
+from utils import z_to_tlwh, z_to_tlbr, z_to_xywh, tlbr_to_z, tlbr_to_tlwh
+from kalman_filter import KalmanFilter, init_kalman_filter
 
 class Track:
     @classmethod
@@ -16,8 +16,16 @@ class Track:
         cls.DELTA_T = delta_t
 
     @classmethod
-    def get_tracks(cls, included_states:list[TrackState]) -> list['Track']:
-        return [track for track in cls.INSTANCES if track.state in included_states]
+    def get_tracks(cls, included_states : list[TrackState] = [], outputs : bool = False) -> list['Track']:
+        if outputs:
+            return [track for track in cls.INSTANCES if all([
+                track.state == STATE_TRACKING,
+                track.kf.x[2,0] >= Track.MIN_BOX_AREA,
+                track.kf.x[3,0] <= Track.MAX_ASPECT_RATIO,
+            ])]
+        else:
+            return [track for track in cls.INSTANCES if track.state in included_states]
+    
 
     @classmethod
     def predict_all(cls) -> None:
@@ -57,7 +65,10 @@ class Track:
 
     @property
     def tlwh(self):
-        return z_to_tlwh(np.array(self.kf.x))
+        if self.state == STATE_TRACKING:
+            return self.update_history[-1]
+        else:
+            return z_to_tlwh(np.array(self.kf.x))
 
     @property
     def tlbr(self):
@@ -80,9 +91,8 @@ class Track:
         invalid_conditions = [
             self.age > Track.MAX_AGE,
             self.state == STATE_UNCONFIRMED and self.age >= 2,
-            self.kf.x[2,0] < Track.MIN_BOX_AREA,
-            self.kf.x[3,0] > Track.MAX_ASPECT_RATIO,
-            np.any(np.isnan(self.kf.x)) or np.any(self.kf.x[2:4, 0] <= 0)
+            np.any(np.isnan(self.kf.x)),
+            np.any(self.kf.x[2:4, 0] <= 0)
         ]   
         if any(invalid_conditions):
             return False
@@ -95,9 +105,10 @@ class Track:
         else:
             self.state = state
         self.last_state = None
-        self.kf = KalmanFilter(dim_x=7, dim_z=4, z=tlbr_to_z(bbox))
+        self.kf = init_kalman_filter(tlbr_to_z(bbox))
+        # self.kf = KalmanFilter(dim_x=7, dim_z=4, z=tlbr_to_z(bbox))
         self.predict_history = []
-        self.update_history = [self.tlwh]
+        self.update_history = [tlbr_to_tlwh(bbox)]
         self.state_history = [self.state]
         self.scores = [float(score)]
         self.age = 0
