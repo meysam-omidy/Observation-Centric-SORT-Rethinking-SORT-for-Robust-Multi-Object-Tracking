@@ -4,10 +4,9 @@ import numpy as np
 import os
 
 @count_time
-def evaluate():
+def evaluate(dataset, split):
     trackers_to_eval = ['ocsort-self', 'oc-sort']
     # trackers_to_eval = 'cbiou'
-    dataset = 'MOT17'
 
     eval_config = {'USE_PARALLEL': True,
                     'NUM_PARALLEL_CORES': 8,
@@ -26,7 +25,7 @@ def evaluate():
                     'OUTPUT_DETAILED': False,
                     'PLOT_CURVES': False}
 
-    dataset_config = {'GT_FOLDER': '../../.Datasets/MOT17/train/',
+    dataset_config = {'GT_FOLDER': f'../../.Datasets/{dataset}/{split}/',
                         'TRACKERS_FOLDER': 'outputs',
                         'OUTPUT_FOLDER': None,
                         'TRACKERS_TO_EVAL': trackers_to_eval,

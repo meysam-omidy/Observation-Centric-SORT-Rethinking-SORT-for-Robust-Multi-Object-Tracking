@@ -1,42 +1,66 @@
 import numpy as np
 import textwrap
 from track_state import STATE_UNCONFIRMED, STATE_TRACKING, STATE_LOST, STATE_DELETED, TrackState
-from utils import z_to_tlwh, z_to_tlbr, z_to_xywh, tlbr_to_z, tlbr_to_tlwh
+from utils import z_to_tlwh, z_to_tlbr, z_to_xywh, tlbr_to_z, tlwh_to_z, tlbr_to_tlwh, tlwh_to_tlbr, tlwh_to_xywh
 from kalman_filter import KalmanFilter, init_kalman_filter
+from pydantic import BaseModel
+
+class TrackConfig(BaseModel):
+    max_age : int = 30
+    delta_t : int = 3
+
 
 class Track:
-    @classmethod
-    def init(cls, max_age, min_box_area, max_aspect_ratio, delta_t):
-        cls.INSTANCES:list['Track'] = []
-        cls.ID_COUNTER = 1
-        cls.FRAME_NUMBER = 0
-        cls.MAX_AGE = max_age
-        cls.MIN_BOX_AREA = min_box_area
-        cls.MAX_ASPECT_RATIO = max_aspect_ratio
-        cls.DELTA_T = delta_t
-
-    @classmethod
-    def get_tracks(cls, included_states : list[TrackState] = [], outputs : bool = False) -> list['Track']:
-        if outputs:
-            return [track for track in cls.INSTANCES if all([
-                track.state == STATE_TRACKING,
-                track.kf.x[2,0] >= Track.MIN_BOX_AREA,
-                track.kf.x[3,0] <= Track.MAX_ASPECT_RATIO,
-            ])]
+    def __init__(self, bbox, score, id, frame_number, config, state=None):
+        self.config = TrackConfig.model_validate(config)
+        if state == None:
+            self.state = STATE_UNCONFIRMED
         else:
-            return [track for track in cls.INSTANCES if track.state in included_states]
-    
+            self.state = state
+        self.last_state = None
+        self.kf = init_kalman_filter(tlbr_to_z(bbox))
+        self.predict_history = []
+        self.update_history = [tlbr_to_tlwh(bbox)]
+        self.state_history = [self.state]
+        self.scores = [float(score)]
+        self.age = 0
+        self.entered_frame = frame_number
+        self.exited_frame = -1
+        self.logs = {
+            'max_time_lost': 0
+        }
+        self.id = id
 
-    @classmethod
-    def predict_all(cls) -> None:
-        cls.FRAME_NUMBER += 1
-        for track in cls.INSTANCES:
-            if track.state not in [STATE_DELETED]:
-                track.predict()
+    def __str__(self):
+        return self.clean_format
     
+    def __repr__(self):
+        return repr(self.compressed_format)
+
+    def predict(self):
+        self.age += 1
+        self.kf.predict()
+        self.predict_history.append(self.tlwh)
+        if self.state == STATE_TRACKING and self.age >= 2:
+            self.state = STATE_LOST
+        self.state_history.append(self.state)
+            
+    def update(self, bbox, score):
+        self.kf.update(tlbr_to_z(bbox))
+        self.update_history.append(tlbr_to_tlwh(bbox))
+        self.scores.append(float(score))
+        self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
+        self.age = 0
+        if self.state == STATE_UNCONFIRMED:
+            self.state = STATE_TRACKING
+        if self.state == STATE_LOST:
+            self.state = STATE_TRACKING
+            self.last_state = None
+
     @property
     def mot_format(self):
-        return f"{int(Track.FRAME_NUMBER)},{int(self.id)},{round(self.tlwh[0], 1)},{round(self.tlwh[1], 1)},{round(self.tlwh[2], 1)},{round(self.tlwh[3], 1)},{round(self.score, 2)},-1,-1,-1"
+        tlwh = self.tlwh
+        return f"{{frame_number}},{int(self.id)},{round(tlwh[0], 1)},{round(tlwh[1], 1)},{round(tlwh[2], 1)},{round(tlwh[3], 1)},{round(self.score, 2)},-1,-1,-1"
 
     @property
     def clean_format(self):
@@ -72,24 +96,37 @@ class Track:
 
     @property
     def tlbr(self):
-        return z_to_tlbr(np.array(self.kf.x))
+        if self.state == STATE_TRACKING:
+            return tlwh_to_tlbr(self.update_history[-1])
+        else:
+            return z_to_tlbr(np.array(self.kf.x))
     
     @property
     def xywh(self):
-        return z_to_xywh(np.array(self.kf.x))
+        if self.state == STATE_TRACKING:
+            return tlwh_to_xywh(self.update_history[-1])
+        else:
+            return z_to_xywh(np.array(self.kf.x))
+        
+    @property
+    def xysa(self):
+        if self.state == STATE_TRACKING:
+            return tlwh_to_z(self.update_history[-1]).reshape(-1)[:4]
+        else:
+            return np.array(self.kf.x).reshape(-1)[:4]
     
     @property
     def speed_direction(self):
-        return self.kf.speed_direction(Track.DELTA_T)
+        return self.kf.speed_direction(self.config.delta_t)
     
     @property
     def k_last_observation(self):
-        return z_to_tlbr(self.kf.k_last_observation(Track.DELTA_T))
+        return z_to_tlbr(self.kf.k_last_observation(self.config.delta_t))
 
     @property
-    def valid(self):
+    def is_valid(self):
         invalid_conditions = [
-            self.age > Track.MAX_AGE,
+            self.age > self.config.max_age,
             self.state == STATE_UNCONFIRMED and self.age >= 2,
             np.any(np.isnan(self.kf.x)),
             np.any(self.kf.x[2:4, 0] <= 0)
@@ -98,56 +135,3 @@ class Track:
             return False
         else:
             return True
-
-    def __init__(self, bbox, score, state=None):
-        if state == None:
-            self.state = STATE_UNCONFIRMED
-        else:
-            self.state = state
-        self.last_state = None
-        self.kf = init_kalman_filter(tlbr_to_z(bbox))
-        # self.kf = KalmanFilter(dim_x=7, dim_z=4, z=tlbr_to_z(bbox))
-        self.predict_history = []
-        self.update_history = [tlbr_to_tlwh(bbox)]
-        self.state_history = [self.state]
-        self.scores = [float(score)]
-        self.age = 0
-        self.entered_frame = Track.FRAME_NUMBER
-        self.exited_frame = -1
-        self.logs = {
-            'max_time_lost': 0
-        }
-        self.id = Track.ID_COUNTER
-        Track.ID_COUNTER += 1
-        Track.INSTANCES.append(self)
-
-    def __str__(self):
-        return self.clean_format
-    
-    def __repr__(self):
-        return repr(self.compressed_format)
-
-    def predict(self):
-        self.age += 1
-        self.kf.predict()
-        if not self.valid:
-            self.last_state = self.state
-            self.state = STATE_DELETED
-            self.exited_frame = Track.FRAME_NUMBER
-            return
-        self.predict_history.append(self.tlwh)
-        if self.state == STATE_TRACKING and self.age >= 2:
-            self.state = STATE_LOST
-        self.state_history.append(self.state)
-            
-    def update(self, bbox, score):
-        self.kf.update(tlbr_to_z(bbox))
-        self.update_history.append(tlbr_to_tlwh(bbox))
-        self.scores.append(float(score))
-        self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
-        self.age = 0
-        if self.state == STATE_UNCONFIRMED:
-            self.state = STATE_TRACKING
-        if self.state == STATE_LOST:
-            self.state = STATE_TRACKING
-            self.last_state = None
