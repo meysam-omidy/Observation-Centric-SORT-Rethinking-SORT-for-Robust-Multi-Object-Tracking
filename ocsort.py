@@ -31,6 +31,9 @@ class OCSORTTracker:
         self.frame_number += 1
         self.predict_tracks()
 
+        # print('*' * 150)
+        # print('frame', self.frame_number)
+
         high_confidence_detections = boxes[boxes[:, 4] >= self.config.high_score_det_threshold][:, :4]
         high_scores = boxes[boxes[:, 4] >= self.config.high_score_det_threshold][:, 4]
         low_confidence_detections = boxes[np.logical_and(boxes[:, 4] <= self.config.high_score_det_threshold, boxes[:, 4] >= self.config.low_score_det_threshold)][:, :4]
@@ -80,8 +83,7 @@ class OCSORTTracker:
         
         unmatched_remained_high_score_detections = select_indices(remained_high_confidence_detections, unmatched_remained_high_score_detection_indices)
         unmatched_remained_high_scores = select_indices(remained_high_scores, unmatched_remained_high_score_detection_indices)
-        # print('*' * 150)
-        # print('frame', Track.FRAME_NUMBER)
+        
         # print('unmatched_remained_high_score_detections', len(np.array(unmatched_remained_high_scores)[np.array(unmatched_remained_high_scores) > self.config.init_track_score_threshold]))
         for d, s in zip(unmatched_remained_high_score_detections, unmatched_remained_high_scores):
             if s < self.config.init_track_score_threshold:

@@ -96,17 +96,11 @@ class Track:
 
     @property
     def tlbr(self):
-        if self.state == STATE_TRACKING:
-            return tlwh_to_tlbr(self.update_history[-1])
-        else:
-            return z_to_tlbr(np.array(self.kf.x))
+        return z_to_tlbr(np.array(self.kf.x))
     
     @property
     def xywh(self):
-        if self.state == STATE_TRACKING:
-            return tlwh_to_xywh(self.update_history[-1])
-        else:
-            return z_to_xywh(np.array(self.kf.x))
+        return z_to_xywh(np.array(self.kf.x))
         
     @property
     def xysa(self):

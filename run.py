@@ -6,11 +6,11 @@ import configparser
 import os
 
 
-DATASET = 'MOT17'
-SPLIT = 'train'
-SEQS = seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
-# SEQS = None
-DETECTION_FOLDER = 'bytetrack_x_mot17'
+DATASET = 'DanceTrack'
+SPLIT = 'val'
+# SEQS = seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
+SEQS = None
+DETECTION_FOLDER = 'ocsort_x_dance'
 
 @count_time
 def run(seq):
