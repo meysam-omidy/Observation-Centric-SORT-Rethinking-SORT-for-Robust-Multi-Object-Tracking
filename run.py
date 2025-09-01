@@ -6,10 +6,11 @@ import configparser
 import os
 
 
+# DATASET = 'MOT17'
 DATASET = 'DanceTrack'
-SPLIT = 'val'
-# SEQS = seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
-SEQS = None
+SPLIT = 'test'
+SEQS = ['dancetrack0003']
+# SEQS = None
 DETECTION_FOLDER = 'ocsort_x_dance'
 
 @count_time
@@ -28,7 +29,6 @@ def run(seq):
         for output in tracker.get_outputs():
             file.write(f'{output}\n')
     file.close()
-
 
 
 if __name__ == '__main__':
