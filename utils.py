@@ -51,7 +51,7 @@ def assignment(cost_matrix):
     matches = np.asarray(matches)
     return matches.tolist(), unmatched_a.tolist(), unmatched_b.tolist()
 
-def associate(tracks, detections, scores, iou_threshold, iou_coefficient, speed_direction_coefficient, with_print=False):
+def associate(tracks, detections, scores, iou_threshold, iou_coefficient, speed_direction_coefficient, logger, phase):
     if len(tracks) == 0:
         return [], [], [i for i in range(len(detections))]
     elif len(detections) == 0:
@@ -81,20 +81,53 @@ def associate(tracks, detections, scores, iou_threshold, iou_coefficient, speed_
             unmatched_detections.append(j)
     for i,j in matchs_to_remove:
         matched_tracks.remove([i,j])
-    if with_print:
-        print('tracks', track_tlbrs)
-        print('track ids', [t.id for t in tracks])
-        print('track_speed_directions', track_speed_directions)
-        print('detections', detections)
-        print('scores_matrix', scores_matrix)
-        print('iou', 1 - iou_cost)
-        print('speed_directions_cost', speed_directions_cost)
-        print('matrix', speed_direction_coefficient_matrix)
-        print('cost', cost)
-        print('matchs_to_remove', matchs_to_remove)
-        print('matched_tracks', matched_tracks)
-        print('unmatched_tracks', unmatched_tracks)
-        print('unmatched_detections', unmatched_detections)
+    if logger:
+        track_ids = [t.id for t in tracks]
+        unmatched_track_ids = [track_ids[i] for i in unmatched_tracks]
+        matched_tracks_ = [[track_ids[i], j+1] for i,j in matched_tracks]
+        unmatched_detections_ = [i+1 for i in unmatched_detections]
+        matchs_to_remove_ = [[track_ids[i], j] for i,j in matchs_to_remove]
+        text = f'PHASE {phase}'
+        logger.info(f'{"*" * int((150 - len(text)) / 2)}  {text}  {"*" * int((150 - len(text)) / 2)}')
+        logger.info(f'tracks')
+        logger.info(f'{np.array2string(track_tlbrs, precision=3, suppress_small=True)}')
+        logger.info(f'track ids')
+        logger.info(f'{track_ids}')
+        logger.info(f'track_speed_directions')
+        logger.info(f'{np.array2string(track_speed_directions, precision=3, suppress_small=True)}')
+        logger.info(f'detections')
+        logger.info(f'{np.array2string(np.array(detections), precision=3, suppress_small=True)}',)
+        logger.info(f'scores_matrix')
+        logger.info(f'{np.array2string(scores_matrix, precision=3, suppress_small=True)}')
+        logger.info(f'iou')
+        logger.info(f'{np.array2string(1 - iou_cost, precision=3, suppress_small=True)}')
+        logger.info(f'speed_directions_cost')
+        logger.info(f'{np.array2string(speed_directions_cost, precision=3, suppress_small=True)}')
+        logger.info(f'cost')
+        logger.info(f'{np.array2string(cost, precision=3, suppress_small=True)}')
+        logger.info(f'matchs_to_remove')
+        logger.info(f'{matchs_to_remove_}')
+        logger.info(f'matched_tracks')
+        logger.info(f'{matched_tracks_}')
+        logger.info(f'unmatched_track ids')
+        logger.info(f'{unmatched_track_ids}')
+        logger.info(f'unmatched_detections')
+        logger.info(f'{unmatched_detections_}')
+        # logger.info('*' * 150)
+    # if with_print:
+    #     print('tracks', track_tlbrs)
+    #     print('track ids', [t.id for t in tracks])
+    #     print('track_speed_directions', track_speed_directions)
+    #     print('detections', detections)
+    #     print('scores_matrix', scores_matrix)
+    #     print('iou', 1 - iou_cost)
+    #     print('speed_directions_cost', speed_directions_cost)
+    #     print('matrix', speed_direction_coefficient_matrix)
+    #     print('cost', cost)
+    #     print('matchs_to_remove', matchs_to_remove)
+    #     print('matched_tracks', matched_tracks)
+    #     print('unmatched_tracks', unmatched_tracks)
+    #     print('unmatched_detections', unmatched_detections)
     return matched_tracks, unmatched_tracks, unmatched_detections
     
 def select_indices(arr, indices):

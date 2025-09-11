@@ -91,7 +91,7 @@ class KalmanFilter(KalmanFilterBase):
         return batch_speed_direction(box_k, box_last)[0,0]
  
 
-def init_kalman_filter(z):
+def init_kalman_filter(z, c) -> KalmanFilter:
     kf = KalmanFilter(7, 4)
     # kf.F = np.array([
     #     [1,0,0,0,1,0,0,0,0.5,0,0,0],
@@ -132,6 +132,7 @@ def init_kalman_filter(z):
     kf.F = np.array([[1,0,0,0,1,0,0],[0,1,0,0,0,1,0],[0,0,1,0,0,0,1],[0,0,0,1,0,0,0],[0,0,0,0,1,0,0],[0,0,0,0,0,1,0],[0,0,0,0,0,0,1]])
     kf.H = np.array([[1,0,0,0,0,0,0],[0,1,0,0,0,0,0],[0,0,1,0,0,0,0],[0,0,0,1,0,0,0]])
     kf.R[2:,2:] *= 10
+    kf.R *= np.e ** (2 * (1 - c))
     kf.P[4:,4:] *= 1000
     kf.P *= 10.
     kf.Q[-1,-1] *= 0.01
