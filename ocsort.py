@@ -1,8 +1,9 @@
 from track import Track
-from track_state import STATE_UNCONFIRMED, STATE_TRACKING, STATE_LOST, STATE_DELETED, TrackState
+from track_state import TrackState, StateUnconfirmed, StateTracking, StateLost, StateDeleted
 from utils import associate, select_indices, count_time
 from pydantic import BaseModel
 import numpy as np
+import logging
 
 class OCSORTTrackerConfig(BaseModel):
     max_age : int = 30
@@ -18,6 +19,7 @@ class OCSORTTrackerConfig(BaseModel):
     association_iou_coefficient : float = 1
     association_speed_direction_coefficient : float = 0.2
     use_byte : bool = False
+    log_path : str = None
     
 
 class OCSORTTracker:
@@ -26,19 +28,33 @@ class OCSORTTracker:
         self.tracks : list[Track] = []
         self.frame_number = 0
         self.id_counter = 1
+        if self.config.log_path:
+            self.logger = logging.getLogger(f"{self.__class__.__name__}-{id(self)}")
+            self.logger.setLevel(logging.INFO)
+            file_handler = logging.FileHandler(self.config.log_path, 'w')
+            file_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter("%(message)s")
+            file_handler.setFormatter(formatter)
+            if not self.logger.handlers:
+                self.logger.addHandler(file_handler)
+        else:
+            self.logger = None
 
     def update(self, boxes): 
         self.frame_number += 1
         self.predict_tracks()
 
-        # print('*' * 150)
-        # print('frame', self.frame_number)
+        if self.config.log_path:
+            text = f'FRAME {self.frame_number}'
+            self.logger.info('')
+            self.logger.info(f'{"#" * int((150 - len(text)) / 2)}  {text}  {"#" * int((150 - len(text)) / 2)}')
+            self.logger.info('')
 
         high_confidence_detections = boxes[boxes[:, 4] >= self.config.high_score_det_threshold][:, :4]
         high_scores = boxes[boxes[:, 4] >= self.config.high_score_det_threshold][:, 4]
         low_confidence_detections = boxes[np.logical_and(boxes[:, 4] <= self.config.high_score_det_threshold, boxes[:, 4] >= self.config.low_score_det_threshold)][:, :4]
         low_scores = boxes[np.logical_and(boxes[:, 4] <= self.config.high_score_det_threshold, boxes[:, 4] >= self.config.low_score_det_threshold)][:, 4]
-        confirmed_tracks = self.get_tracks([STATE_TRACKING, STATE_LOST])   
+        confirmed_tracks = self.get_tracks([StateTracking, StateLost])   
         matches, unmatched_confirmed_track_indices, unmatched_high_confidence_detection_indices = associate(
             confirmed_tracks, 
             high_confidence_detections, 
@@ -46,28 +62,32 @@ class OCSORTTracker:
             self.config.match_high_score_dets_with_confirmed_trks_threshold,
             self.config.association_iou_coefficient,
             self.config.association_speed_direction_coefficient,
-            # with_print=True
+            logger=self.logger,
+            phase=1
         )
         for t_i, d_i in matches:
             confirmed_tracks[t_i].update(high_confidence_detections[d_i], score=high_scores[d_i])
 
         if self.config.use_byte:
             remained_confirmed_tracks = select_indices(confirmed_tracks, unmatched_confirmed_track_indices)
-            remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state == STATE_TRACKING]
+            # remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking, StateLost]]
+            remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state == StateTracking]
             matches, unmatched_remained_track_indices, unmatched_low_score_detection_indices = associate(
                 remained_tracking_tracks, 
                 low_confidence_detections, 
                 low_scores,
                 self.config.match_low_score_dets_with_confirmed_trks_threshold,
                 self.config.association_iou_coefficient,
-                self.config.association_speed_direction_coefficient
+                self.config.association_speed_direction_coefficient,
+                logger=self.logger,
+                phase=2
             )
             for t_i, d_i in matches:
                 remained_tracking_tracks[t_i].update(low_confidence_detections[d_i], score=low_scores[d_i])
 
         remained_high_confidence_detections = select_indices(high_confidence_detections, unmatched_high_confidence_detection_indices)
         remained_high_scores = select_indices(high_scores, unmatched_high_confidence_detection_indices)
-        unconfirmed_tracks = self.get_tracks([STATE_UNCONFIRMED])
+        unconfirmed_tracks = self.get_tracks([StateUnconfirmed])
         matches, unmatched_unconfirmed_track_indices, unmatched_remained_high_score_detection_indices = associate(
             unconfirmed_tracks, 
             remained_high_confidence_detections, 
@@ -75,16 +95,14 @@ class OCSORTTracker:
             self.config.match_remained_high_score_dets_with_unconfirmed_trks_threshold,
             self.config.association_iou_coefficient,
             self.config.association_speed_direction_coefficient,
-            # with_print=True
+            logger=self.logger,
+            phase=3
         )
-
         for t_i, d_i in matches:
             unconfirmed_tracks[t_i].update(remained_high_confidence_detections[d_i], score=remained_high_scores[d_i])
         
         unmatched_remained_high_score_detections = select_indices(remained_high_confidence_detections, unmatched_remained_high_score_detection_indices)
         unmatched_remained_high_scores = select_indices(remained_high_scores, unmatched_remained_high_score_detection_indices)
-        
-        # print('unmatched_remained_high_score_detections', len(np.array(unmatched_remained_high_scores)[np.array(unmatched_remained_high_scores) > self.config.init_track_score_threshold]))
         for d, s in zip(unmatched_remained_high_score_detections, unmatched_remained_high_scores):
             if s < self.config.init_track_score_threshold:
                 continue
@@ -92,22 +110,23 @@ class OCSORTTracker:
 
     def init_track(self, bbox, score):
         track_config = {
-            'max_age': self.config.max_age,
+            'max_age': int(50 * score),
             'delta_t' : self.config.delta_t
         }
         if self.frame_number == 1:
-            self.tracks.append(Track(bbox, score, self.id_counter, self.frame_number, track_config, STATE_TRACKING))
+            self.tracks.append(Track(bbox, score, self.id_counter, self.frame_number, track_config, StateTracking))
         else:
-            self.tracks.append(Track(bbox, score, self.id_counter, self.frame_number, track_config, STATE_UNCONFIRMED))
+            self.tracks.append(Track(bbox, score, self.id_counter, self.frame_number, track_config, StateUnconfirmed))
         self.id_counter += 1
 
     def predict_tracks(self):
         for track in self.tracks:
-            track.predict()
-            if not track.is_valid:
-                track.last_state = track.state
-                track.state = STATE_DELETED
-                track.exited_frame = self.frame_number - 1
+            if track.state != StateDeleted:
+                track.predict()
+                if not track.is_valid:
+                    track.last_state = track.state
+                    track.state = StateDeleted
+                    track.exited_frame = self.frame_number - 1
 
     def get_tracks(self, included_states : list[TrackState] = []):
         return [track for track in self.tracks if track.state in included_states]
@@ -117,7 +136,8 @@ class OCSORTTracker:
         for track in self.tracks:
             s, a = track.xysa[2:]
             if all([
-                track.state == STATE_TRACKING,
+                track.state in [StateTracking],
+                # track.state == StateTracking,
                 s >= self.config.min_box_area,
                 a <= self.config.max_aspect_ratio
             ]):

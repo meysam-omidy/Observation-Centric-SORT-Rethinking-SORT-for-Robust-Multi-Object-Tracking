@@ -1,6 +1,6 @@
 import numpy as np
 import textwrap
-from track_state import STATE_UNCONFIRMED, STATE_TRACKING, STATE_LOST, STATE_DELETED, TrackState
+from track_state import StateUnconfirmed, StateTracking, StateLost, StateDeleted
 from utils import z_to_tlwh, z_to_tlbr, z_to_xywh, tlbr_to_z, tlwh_to_z, tlbr_to_tlwh, tlwh_to_tlbr, tlwh_to_xywh
 from kalman_filter import KalmanFilter, init_kalman_filter
 from pydantic import BaseModel
@@ -14,11 +14,11 @@ class Track:
     def __init__(self, bbox, score, id, frame_number, config, state=None):
         self.config = TrackConfig.model_validate(config)
         if state == None:
-            self.state = STATE_UNCONFIRMED
+            self.state = StateUnconfirmed
         else:
             self.state = state
         self.last_state = None
-        self.kf = init_kalman_filter(tlbr_to_z(bbox))
+        self.kf = init_kalman_filter(tlbr_to_z(bbox), score)
         self.predict_history = []
         self.update_history = [tlbr_to_tlwh(bbox)]
         self.state_history = [self.state]
@@ -40,21 +40,25 @@ class Track:
     def predict(self):
         self.age += 1
         self.kf.predict()
-        self.predict_history.append(self.tlwh)
-        if self.state == STATE_TRACKING and self.age >= 2:
-            self.state = STATE_LOST
+        self.predict_history.append(z_to_tlwh(np.array(self.kf.x)))
+        if self.state == StateTracking and self.age >= 2:
+            self.state = StateLost
         self.state_history.append(self.state)
             
     def update(self, bbox, score):
-        self.kf.update(tlbr_to_z(bbox))
+        R = np.eye(4)
+        R[2:, 2:] *= 10
+        R *= np.e ** (2 * (1 - score))
+        # self.kf.update(tlbr_to_z(bbox))
+        self.kf.update(tlbr_to_z(bbox), R=R)
         self.update_history.append(tlbr_to_tlwh(bbox))
         self.scores.append(float(score))
         self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
         self.age = 0
-        if self.state == STATE_UNCONFIRMED:
-            self.state = STATE_TRACKING
-        if self.state == STATE_LOST:
-            self.state = STATE_TRACKING
+        if self.state == StateUnconfirmed:
+            self.state = StateTracking
+        if self.state == StateLost:
+            self.state = StateTracking
             self.last_state = None
 
     @property
@@ -72,7 +76,7 @@ class Track:
             age        -> {self.age}
             score      -> {self.score}
             entered    -> {self.entered_frame}
-            {f'exited     -> {self.exited_frame}' if self.state == STATE_DELETED else ''}
+            {f'exited     -> {self.exited_frame}' if self.state == StateDeleted else ''}
             {f'last state -> {self.last_state.name}' if self.last_state else ''}
             """).strip()
     
@@ -89,7 +93,7 @@ class Track:
 
     @property
     def tlwh(self):
-        if self.state == STATE_TRACKING:
+        if self.state == StateTracking:
             return self.update_history[-1]
         else:
             return z_to_tlwh(np.array(self.kf.x))
@@ -104,7 +108,7 @@ class Track:
         
     @property
     def xysa(self):
-        if self.state == STATE_TRACKING:
+        if self.state == StateTracking:
             return tlwh_to_z(self.update_history[-1]).reshape(-1)[:4]
         else:
             return np.array(self.kf.x).reshape(-1)[:4]
@@ -121,7 +125,7 @@ class Track:
     def is_valid(self):
         invalid_conditions = [
             self.age > self.config.max_age,
-            self.state == STATE_UNCONFIRMED and self.age >= 2,
+            self.state == StateUnconfirmed and self.age >= 2,
             np.any(np.isnan(self.kf.x)),
             np.any(self.kf.x[2:4, 0] <= 0)
         ]   
