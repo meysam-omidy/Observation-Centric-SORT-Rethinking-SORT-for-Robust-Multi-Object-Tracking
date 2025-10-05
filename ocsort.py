@@ -42,7 +42,9 @@ class OCSORTTracker:
 
     def update(self, boxes): 
         self.frame_number += 1
-        self.predict_tracks()
+        # self.predict_tracks()
+        for track in self.tracks:
+            track.current_frame_update = None
 
         if self.config.log_path:
             text = f'FRAME {self.frame_number}'
@@ -66,7 +68,8 @@ class OCSORTTracker:
             phase=1
         )
         for t_i, d_i in matches:
-            confirmed_tracks[t_i].update(high_confidence_detections[d_i], score=high_scores[d_i])
+            confirmed_tracks[t_i].current_frame_update = [high_confidence_detections[d_i], high_scores[d_i]]
+            # confirmed_tracks[t_i].update(high_confidence_detections[d_i], score=high_scores[d_i])
 
         if self.config.use_byte:
             remained_confirmed_tracks = select_indices(confirmed_tracks, unmatched_confirmed_track_indices)
@@ -83,7 +86,8 @@ class OCSORTTracker:
                 phase=2
             )
             for t_i, d_i in matches:
-                remained_tracking_tracks[t_i].update(low_confidence_detections[d_i], score=low_scores[d_i])
+                remained_tracking_tracks[t_i].current_frame_update = [low_confidence_detections[d_i], low_scores[d_i]]
+                # remained_tracking_tracks[t_i].update(low_confidence_detections[d_i], score=low_scores[d_i])
 
         remained_high_confidence_detections = select_indices(high_confidence_detections, unmatched_high_confidence_detection_indices)
         remained_high_scores = select_indices(high_scores, unmatched_high_confidence_detection_indices)
@@ -99,7 +103,8 @@ class OCSORTTracker:
             phase=3
         )
         for t_i, d_i in matches:
-            unconfirmed_tracks[t_i].update(remained_high_confidence_detections[d_i], score=remained_high_scores[d_i])
+            unconfirmed_tracks[t_i].current_frame_update = [remained_high_confidence_detections[d_i], remained_high_scores[d_i]]
+            # unconfirmed_tracks[t_i].update(remained_high_confidence_detections[d_i], score=remained_high_scores[d_i])
         
         unmatched_remained_high_score_detections = select_indices(remained_high_confidence_detections, unmatched_remained_high_score_detection_indices)
         unmatched_remained_high_scores = select_indices(remained_high_scores, unmatched_remained_high_score_detection_indices)
@@ -108,9 +113,16 @@ class OCSORTTracker:
                 continue
             self.init_track(d, s)
 
+        self.predict_tracks()
+        for track in self.tracks:
+            if track.current_frame_update != None:
+                bbox, score = track.current_frame_update
+                track.update(bbox, score)
+
     def init_track(self, bbox, score):
         track_config = {
-            'max_age': int(50 * score),
+            # 'max_age': 30,
+            'max_age': 30,
             'delta_t' : self.config.delta_t
         }
         if self.frame_number == 1:
@@ -121,7 +133,7 @@ class OCSORTTracker:
 
     def predict_tracks(self):
         for track in self.tracks:
-            if track.state != StateDeleted:
+            if track.state != StateDeleted and track.entered_frame != self.frame_number:
                 track.predict()
                 if not track.is_valid:
                     track.last_state = track.state

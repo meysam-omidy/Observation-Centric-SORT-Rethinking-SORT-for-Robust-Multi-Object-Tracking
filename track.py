@@ -1,7 +1,7 @@
 import numpy as np
 import textwrap
 from track_state import StateUnconfirmed, StateTracking, StateLost, StateDeleted
-from utils import z_to_tlwh, z_to_tlbr, z_to_xywh, tlbr_to_z, tlwh_to_z, tlbr_to_tlwh, tlwh_to_tlbr, tlwh_to_xywh
+from utils import z_to_tlwh, z_to_tlbr, z_to_xywh, tlbr_to_z, tlwh_to_z, tlbr_to_tlwh, tlwh_to_tlbr, tlwh_to_xywh, get_r_matrix
 from kalman_filter import KalmanFilter, init_kalman_filter
 from pydantic import BaseModel
 
@@ -22,6 +22,7 @@ class Track:
         self.predict_history = []
         self.update_history = [tlbr_to_tlwh(bbox)]
         self.state_history = [self.state]
+        self.current_frame_update = None
         self.scores = [float(score)]
         self.age = 0
         self.entered_frame = frame_number
@@ -46,11 +47,12 @@ class Track:
         self.state_history.append(self.state)
             
     def update(self, bbox, score):
-        R = np.eye(4)
-        R[2:, 2:] *= 10
-        R *= np.e ** (2 * (1 - score))
-        # self.kf.update(tlbr_to_z(bbox))
-        self.kf.update(tlbr_to_z(bbox), R=R)
+        R = get_r_matrix(score)
+        # R = np.eye(4)
+        # R[2:, 2:] *= 10
+        # R *= np.e ** (2 * (1 - score))
+        self.kf.update(tlbr_to_z(bbox))
+        # self.kf.update(tlbr_to_z(bbox), R=R)
         self.update_history.append(tlbr_to_tlwh(bbox))
         self.scores.append(float(score))
         self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
@@ -87,7 +89,8 @@ class Track:
     @property
     def score(self):
         if len(self.scores) > 0:
-            return float(self.scores[-1])
+            return np.mean(self.scores).item()
+            # return float(self.scores[-1])
         else:
             return 0
 
@@ -125,7 +128,7 @@ class Track:
     def is_valid(self):
         invalid_conditions = [
             self.age > self.config.max_age,
-            self.state == StateUnconfirmed and self.age >= 2,
+            self.state == StateUnconfirmed and self.age >= 2 and self.current_frame_update == None,
             np.any(np.isnan(self.kf.x)),
             np.any(self.kf.x[2:4, 0] <= 0)
         ]   

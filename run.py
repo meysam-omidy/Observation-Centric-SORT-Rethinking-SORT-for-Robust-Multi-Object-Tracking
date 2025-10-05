@@ -4,14 +4,14 @@ from evaluate import evaluate
 from utils import count_time
 import configparser
 import os
-
+import concurrent.futures
 
 # DATASET = 'MOT17'
 DATASET = 'DanceTrack'
 SPLIT = 'train'
 # SEQS = seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
-# SEQS = None
-SEQS = ['dancetrack0033']
+SEQS = None
+SEQS = ['dancetrack0029']
 DETECTION_FOLDER = 'ocsort_x_dance'
 
 @count_time
@@ -19,11 +19,11 @@ def run(seq):
     print(seq)
     tracker = OCSORTTracker({
         # 'high_score_det_threshold': 0.5,
-        'use_byte': True,
+        # 'use_byte': True,
         # 'log_path': 'file.log'
         # 'association_speed_direction_coefficient': 1
     })
-    os.makedirs('outputs/ocsort-self', exist_ok=True)
+    # os.makedirs('outputs/ocsort-self', exist_ok=True)
     file = open(f'outputs/ocsort-self/{seq}.txt', 'w')
     detections = np.loadtxt(f'detections/{DETECTION_FOLDER}/{seq}.txt', delimiter=',')
     config = configparser.ConfigParser()

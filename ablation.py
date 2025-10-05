@@ -11,7 +11,7 @@ DATASET = 'DanceTrack'
 SPLIT = 'train'
 SEQS = None
 DETECTION_FOLDER = 'ocsort_x_dance'
-ABLATION_NAME = 'with_byte_and_r_and_tracking_in_byte'
+ABLATION_NAME = 'with_byte_and_config_pr'
 
 
 def evaluate(dataset, split):
@@ -138,13 +138,13 @@ if __name__ == '__main__':
         seqs = SEQS
     else:
         seqs = os.listdir(f'../../.Datasets/{DATASET}/{SPLIT}/')
-    seqs = ['dancetrack0033']
-    # os.makedirs('ablations/ocsort-self', exist_ok=True)
+    # seqs = ['dancetrack0033']
+    os.makedirs('ablations/ocsort-self', exist_ok=True)
     for seq in seqs:
         seqmap = open(f'./trackeval/seqmap/{DATASET.lower()}/custom.txt', 'w')
         seqmap.write('name\n')
         seqmap.write(f'{seq}\n')
         seqmap.close()
         run(seq)
-        # evaluate(DATASET, SPLIT)
+        evaluate(DATASET, SPLIT)
     

@@ -1,8 +1,10 @@
 import numpy as np
 import lap
 import time
+import pickle
 
 def count_time(func):
+    
     def wrapper(*args, **kwargs):
         start = time.time()
         result = func(*args, **kwargs)
@@ -113,21 +115,6 @@ def associate(tracks, detections, scores, iou_threshold, iou_coefficient, speed_
         logger.info(f'{unmatched_track_ids}')
         logger.info(f'unmatched_detections')
         logger.info(f'{unmatched_detections_}')
-        # logger.info('*' * 150)
-    # if with_print:
-    #     print('tracks', track_tlbrs)
-    #     print('track ids', [t.id for t in tracks])
-    #     print('track_speed_directions', track_speed_directions)
-    #     print('detections', detections)
-    #     print('scores_matrix', scores_matrix)
-    #     print('iou', 1 - iou_cost)
-    #     print('speed_directions_cost', speed_directions_cost)
-    #     print('matrix', speed_direction_coefficient_matrix)
-    #     print('cost', cost)
-    #     print('matchs_to_remove', matchs_to_remove)
-    #     print('matched_tracks', matched_tracks)
-    #     print('unmatched_tracks', unmatched_tracks)
-    #     print('unmatched_detections', unmatched_detections)
     return matched_tracks, unmatched_tracks, unmatched_detections
     
 def select_indices(arr, indices):
@@ -136,6 +123,27 @@ def select_indices(arr, indices):
 def get_dict_item(obj:dict, index:int):
     values = list(obj.values())
     return values[index]
+
+def get_r_matrix(c):
+    with open('config/r.pickle', 'rb') as f:
+    # with open('config/r.pickle', 'rb') as f:
+        r_dict = pickle.load(f)
+        c_keys = np.array(list(r_dict.keys()))
+        c_dists = np.abs(c_keys - c)
+        nearest_c =c_keys[c_dists.argmin()]
+        return r_dict[nearest_c]
+
+def get_p_matrix(c):
+    with open('config/p.pickle', 'rb') as f:
+    # with open('config/p.pickle', 'rb') as f:
+        p_dict = pickle.load(f)
+        c_keys = np.array(list(p_dict.keys()))
+        c_dists = np.abs(c_keys - c)
+        nearest_c =c_keys[c_dists.argmin()]
+        return p_dict[nearest_c]
+    
+def print_matrix(x, precision=3):
+    print(np.array2string(x, precision=precision, suppress_small=True))
     
 def tlbr_to_tlwh(bbox:np.ndarray) -> np.ndarray:
     o = np.zeros_like(bbox, dtype=float)
