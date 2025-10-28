@@ -8,27 +8,32 @@ import concurrent.futures
 
 # DATASET = 'MOT17'
 DATASET = 'DanceTrack'
-SPLIT = 'train'
+SPLIT = 'val'
 # SEQS = seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
 SEQS = None
-SEQS = ['dancetrack0029']
+# SEQS = ['MOT17-02-FRCNN']
+# SEQS = ['dancetrack0041']
+# DETECTION_FOLDER = 'ocsort_x_mot20'
+# DETECTION_FOLDER = 'bytetrack_x_mot17'
 DETECTION_FOLDER = 'ocsort_x_dance'
 
 @count_time
 def run(seq):
     print(seq)
-    tracker = OCSORTTracker({
-        # 'high_score_det_threshold': 0.5,
-        # 'use_byte': True,
-        # 'log_path': 'file.log'
-        # 'association_speed_direction_coefficient': 1
-    })
     # os.makedirs('outputs/ocsort-self', exist_ok=True)
     file = open(f'outputs/ocsort-self/{seq}.txt', 'w')
     detections = np.loadtxt(f'detections/{DETECTION_FOLDER}/{seq}.txt', delimiter=',')
     config = configparser.ConfigParser()
     config.read(f'../../.Datasets/{DATASET}/{SPLIT}/{seq}/seqinfo.ini')
-    
+    tracker = OCSORTTracker({
+        # 'high_score_det_threshold': 0.5,
+        'image_width': config['Sequence']['imWidth'],
+        'image_height': config['Sequence']['imHeight'],
+        # 'association_speed_direction_coefficient': 0,
+        # 'use_byte': True,
+        # 'log_path': 'file.log'
+        # 'association_speed_direction_coefficient': 1
+    })
     for frame_number in range(1, int(config['Sequence']['seqLength']) + 1):
         dets = detections[detections[:, 0] == frame_number][:, 1:]
         tracker.update(dets)

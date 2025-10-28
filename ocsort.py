@@ -2,7 +2,9 @@ from track import Track
 from track_state import TrackState, StateUnconfirmed, StateTracking, StateLost, StateDeleted
 from utils import associate, select_indices, count_time
 from pydantic import BaseModel
+from motion_predictor import device as DEVICE, model as MODEL
 import numpy as np
+import torch
 import logging
 
 class OCSORTTrackerConfig(BaseModel):
@@ -18,6 +20,8 @@ class OCSORTTrackerConfig(BaseModel):
     match_remained_high_score_dets_with_unconfirmed_trks_threshold : float = 0.3
     association_iou_coefficient : float = 1
     association_speed_direction_coefficient : float = 0.2
+    image_width : int = 1920
+    image_height : int = 1080
     use_byte : bool = False
     log_path : str = None
     
@@ -42,9 +46,9 @@ class OCSORTTracker:
 
     def update(self, boxes): 
         self.frame_number += 1
-        # self.predict_tracks()
-        for track in self.tracks:
-            track.current_frame_update = None
+        self.predict_tracks()
+        # for track in self.tracks:
+        #     track.current_frame_update = None
 
         if self.config.log_path:
             text = f'FRAME {self.frame_number}'
@@ -68,8 +72,8 @@ class OCSORTTracker:
             phase=1
         )
         for t_i, d_i in matches:
-            confirmed_tracks[t_i].current_frame_update = [high_confidence_detections[d_i], high_scores[d_i]]
-            # confirmed_tracks[t_i].update(high_confidence_detections[d_i], score=high_scores[d_i])
+            # confirmed_tracks[t_i].current_frame_update = [high_confidence_detections[d_i], high_scores[d_i]]
+            confirmed_tracks[t_i].update(high_confidence_detections[d_i], score=high_scores[d_i])
 
         if self.config.use_byte:
             remained_confirmed_tracks = select_indices(confirmed_tracks, unmatched_confirmed_track_indices)
@@ -86,8 +90,8 @@ class OCSORTTracker:
                 phase=2
             )
             for t_i, d_i in matches:
-                remained_tracking_tracks[t_i].current_frame_update = [low_confidence_detections[d_i], low_scores[d_i]]
-                # remained_tracking_tracks[t_i].update(low_confidence_detections[d_i], score=low_scores[d_i])
+                # remained_tracking_tracks[t_i].current_frame_update = [low_confidence_detections[d_i], low_scores[d_i]]
+                remained_tracking_tracks[t_i].update(low_confidence_detections[d_i], score=low_scores[d_i])
 
         remained_high_confidence_detections = select_indices(high_confidence_detections, unmatched_high_confidence_detection_indices)
         remained_high_scores = select_indices(high_scores, unmatched_high_confidence_detection_indices)
@@ -103,8 +107,8 @@ class OCSORTTracker:
             phase=3
         )
         for t_i, d_i in matches:
-            unconfirmed_tracks[t_i].current_frame_update = [remained_high_confidence_detections[d_i], remained_high_scores[d_i]]
-            # unconfirmed_tracks[t_i].update(remained_high_confidence_detections[d_i], score=remained_high_scores[d_i])
+            # unconfirmed_tracks[t_i].current_frame_update = [remained_high_confidence_detections[d_i], remained_high_scores[d_i]]
+            unconfirmed_tracks[t_i].update(remained_high_confidence_detections[d_i], score=remained_high_scores[d_i])
         
         unmatched_remained_high_score_detections = select_indices(remained_high_confidence_detections, unmatched_remained_high_score_detection_indices)
         unmatched_remained_high_scores = select_indices(remained_high_scores, unmatched_remained_high_score_detection_indices)
@@ -113,17 +117,21 @@ class OCSORTTracker:
                 continue
             self.init_track(d, s)
 
-        self.predict_tracks()
-        for track in self.tracks:
-            if track.current_frame_update != None:
-                bbox, score = track.current_frame_update
-                track.update(bbox, score)
+        # self.predict_tracks()
+        # for track in self.tracks:
+        #     if track.current_frame_update != None:
+        #         bbox, score = track.current_frame_update
+        #         track.update(bbox, score)
+        #     else:
+        #         track.update_none()
 
     def init_track(self, bbox, score):
         track_config = {
             # 'max_age': 30,
             'max_age': 30,
-            'delta_t' : self.config.delta_t
+            'delta_t' : self.config.delta_t,
+            'image_width': self.config.image_width,
+            'image_height': self.config.image_height,
         }
         if self.frame_number == 1:
             self.tracks.append(Track(bbox, score, self.id_counter, self.frame_number, track_config, StateTracking))
@@ -132,13 +140,46 @@ class OCSORTTracker:
         self.id_counter += 1
 
     def predict_tracks(self):
+        tracks = []
+        srcs = []
         for track in self.tracks:
-            if track.state != StateDeleted and track.entered_frame != self.frame_number:
+            if track.state != StateDeleted:
+            # if track.state != StateDeleted and track.entered_frame != self.frame_number:
                 track.predict()
-                if not track.is_valid:
-                    track.last_state = track.state
-                    track.state = StateDeleted
-                    track.exited_frame = self.frame_number - 1
+                k_last_updates = track.k_last_updates
+                if len(k_last_updates) == 1:
+                    track.history.predict[track.current_frame] = k_last_updates[0]
+                elif len(k_last_updates) < 10:
+                    diffs = []
+                    for i in range(1, len(k_last_updates)):
+                        diffs.append(k_last_updates[i] - k_last_updates[i - 1])
+                    track.history.predict[track.current_frame] = np.array(diffs).mean(axis=0) + k_last_updates[-1]
+                    # track.history.predict[track.current_frame] = 2 * k_last_updates[1] - k_last_updates[0]
+                else:
+                    src = np.array(k_last_updates, dtype=np.float64)
+                    src[:, 0] /= self.config.image_width
+                    src[:, 1] /= self.config.image_height
+                    src[:, 2] /= self.config.image_width
+                    src[:, 3] /= self.config.image_height
+                    tracks.append(track)
+                    srcs.append(src)
+        if len(tracks) > 0:
+            srcs = np.array(srcs)
+            srcs = torch.tensor(srcs, dtype=torch.float32).to(DEVICE).reshape(srcs.shape[0], srcs.shape[1], 4)
+            trgs = srcs[:, -1:, :]
+            # preds = MODEL.generate(srcs, 1).reshape(srcs.shape[0], 4).cpu().numpy()
+            preds = MODEL.inference(srcs, trgs, 1).reshape(srcs.shape[0], 4).cpu().numpy()
+            preds[:, 0] *= self.config.image_width 
+            preds[:, 1] *= self.config.image_height
+            preds[:, 2] *= self.config.image_width
+            preds[:, 3] *= self.config.image_height
+            for i, track in enumerate(tracks):
+                track.history.predict[track.current_frame] = preds[i]
+        for track in self.tracks:
+            if not track.is_valid:
+                track.last_state = track.state
+                track.state = StateDeleted
+                track.exited_frame = self.frame_number - 1
 
     def get_tracks(self, included_states : list[TrackState] = []):
         return [track for track in self.tracks if track.state in included_states]

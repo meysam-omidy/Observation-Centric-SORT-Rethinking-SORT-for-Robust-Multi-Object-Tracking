@@ -161,6 +161,14 @@ def tlbr_to_xywh(bbox:np.ndarray) -> np.ndarray:
     o[..., 3] = bbox[..., 3] - bbox[..., 1]
     return o
 
+def tlbr_to_xysa(bbox:np.ndarray) -> np.ndarray:
+    o = np.zeros_like(bbox, dtype=float)
+    o[..., 0] = (bbox[..., 0] + bbox[..., 2]) / 2
+    o[..., 1] = (bbox[..., 1] + bbox[..., 3]) / 2
+    o[..., 2] = (bbox[..., 2] - bbox[..., 0]) * (bbox[..., 3] - bbox[..., 1])
+    o[..., 3] = (bbox[..., 2] - bbox[..., 0]) / (bbox[..., 3] - bbox[..., 1])
+    return o
+
 def tlwh_to_tlbr(bbox:np.ndarray) -> np.ndarray:
     o = np.zeros_like(bbox, dtype=float)
     o[..., 0] = bbox[..., 0]
