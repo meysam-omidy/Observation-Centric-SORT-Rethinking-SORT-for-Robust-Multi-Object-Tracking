@@ -149,14 +149,14 @@ class OCSORTTracker:
                 k_last_updates = track.k_last_updates
                 if len(k_last_updates) == 1:
                     track.history.predict[track.current_frame] = k_last_updates[0]
-                elif len(k_last_updates) < 10:
+                elif len(k_last_updates) < 30:
                     diffs = []
                     for i in range(1, len(k_last_updates)):
                         diffs.append(k_last_updates[i] - k_last_updates[i - 1])
                     track.history.predict[track.current_frame] = np.array(diffs).mean(axis=0) + k_last_updates[-1]
                     # track.history.predict[track.current_frame] = 2 * k_last_updates[1] - k_last_updates[0]
                 else:
-                    src = np.array(k_last_updates, dtype=np.float64)
+                    src = np.array(k_last_updates, dtype=np.float32)
                     src[:, 0] /= self.config.image_width
                     src[:, 1] /= self.config.image_height
                     src[:, 2] /= self.config.image_width
@@ -176,7 +176,7 @@ class OCSORTTracker:
             for i, track in enumerate(tracks):
                 track.history.predict[track.current_frame] = preds[i]
         for track in self.tracks:
-            if not track.is_valid:
+            if track.state != StateDeleted and not track.is_valid:
                 track.last_state = track.state
                 track.state = StateDeleted
                 track.exited_frame = self.frame_number - 1

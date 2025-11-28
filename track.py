@@ -81,7 +81,7 @@ class Track:
     @property
     def k_last_updates(self):
         k_last = []
-        for i in range(self.current_frame - 10, self.current_frame):
+        for i in range(self.current_frame - 30, self.current_frame):
             if i in self.history.update:
                 k_last.append(self.history.update[i])
             elif i in self.history.predict:

@@ -11,7 +11,7 @@ DATASET = 'DanceTrack'
 SPLIT = 'train'
 SEQS = None
 DETECTION_FOLDER = 'ocsort_x_dance'
-ABLATION_NAME = 'with_byte_and_config_pr'
+ABLATION_NAME = 'with_byte_and_lstm_base_noisy_trained'
 
 
 def evaluate(dataset, split):

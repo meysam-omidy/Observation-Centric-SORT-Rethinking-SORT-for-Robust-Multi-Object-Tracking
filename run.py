@@ -12,7 +12,7 @@ SPLIT = 'val'
 # SEQS = seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
 SEQS = None
 # SEQS = ['MOT17-02-FRCNN']
-# SEQS = ['dancetrack0041']
+SEQS = ['dancetrack0041']
 # DETECTION_FOLDER = 'ocsort_x_mot20'
 # DETECTION_FOLDER = 'bytetrack_x_mot17'
 DETECTION_FOLDER = 'ocsort_x_dance'
@@ -29,8 +29,8 @@ def run(seq):
         # 'high_score_det_threshold': 0.5,
         'image_width': config['Sequence']['imWidth'],
         'image_height': config['Sequence']['imHeight'],
-        # 'association_speed_direction_coefficient': 0,
-        # 'use_byte': True,
+        'association_speed_direction_coefficient': 0,
+        'use_byte': True,
         # 'log_path': 'file.log'
         # 'association_speed_direction_coefficient': 1
     })
