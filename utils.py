@@ -1,7 +1,9 @@
 import numpy as np
+from typing import Union
 import lap
 import time
 import pickle
+from copy import copy
 
 def count_time(func):
     
@@ -244,6 +246,91 @@ def z_to_xywh(z:np.ndarray) -> np.ndarray:
     o[..., 3] = sqrt(z[..., 2] / z[..., 3])
     return o[:4]
 
+
+class BBOX(np.ndarray):
+    def __new__(cls, bbox):
+        return np.asarray(bbox).view(cls)
+    
+    def __repr__(self):
+        return super().__repr__()
+    
+    def __str__(self):
+        return super().__str__()
+
+    @classmethod
+    def from_tlbr(cls, obj : Union[list, np.ndarray]) -> "BBOX":
+        bbox = np.array(obj)
+        o = np.zeros_like(bbox, dtype=float)
+        o[..., 0] = (bbox[..., 0] + bbox[..., 2]) / 2
+        o[..., 1] = (bbox[..., 1] + bbox[..., 3]) / 2
+        o[..., 2] = bbox[..., 2] - bbox[..., 0]
+        o[..., 3] = bbox[..., 3] - bbox[..., 1]
+        return cls(o)
+
+    @classmethod
+    def from_tlwh(cls, obj : Union[list, np.ndarray]) -> "BBOX":
+        bbox = np.array(obj)
+        o = np.zeros_like(bbox, dtype=float)
+        o[..., 0] = bbox[..., 0] + bbox[..., 2] / 2
+        o[..., 1] = bbox[..., 1] + bbox[..., 3] / 2
+        o[..., 2] = bbox[..., 2]
+        o[..., 3] = bbox[..., 3]
+        return cls(o)
+
+    @classmethod
+    def from_xysa(cls, obj : Union[list, np.ndarray]) -> "BBOX":
+        bbox = np.array(obj)
+        z = z.reshape(-1)
+        o = np.zeros_like(z, dtype=float)
+        o[..., 0] = bbox[..., 0]
+        o[..., 1] = bbox[..., 1]
+        o[..., 2] = sqrt(bbox[..., 2] * bbox[..., 3])
+        o[..., 3] = sqrt(bbox[..., 2] / bbox[..., 3])
+        return cls(o)
+    
+    def to_tlbr(self) -> np.ndarray:
+        o = np.zeros_like(self, dtype=float)
+        o[..., 0] = self[..., 0] - self[..., 2] / 2
+        o[..., 1] = self[..., 1] - self[..., 3] / 2
+        o[..., 2] = self[..., 0] + self[..., 2] / 2
+        o[..., 3] = self[..., 1] + self[..., 3] / 2
+        return o
+    
+    def to_tlwh(self) -> np.ndarray:
+        o = np.zeros_like(self, dtype=float)
+        o[..., 0] = self[..., 0] - self[..., 2] / 2
+        o[..., 1] = self[..., 1] - self[..., 3] / 2
+        o[..., 2] = self[..., 2]
+        o[..., 3] = self[..., 3]
+        return o
+    
+    def to_xysa(self) -> np.ndarray:
+        o = np.zeros_like(self, dtype=float)
+        o[..., 0] = self[..., 0]
+        o[..., 1] = self[..., 1]
+        o[..., 2] = self[..., 2] * self[..., 3]
+        o[..., 3] = self[..., 2] / self[..., 3]
+        return o
+
 def sqrt(x:np.ndarray) -> np.ndarray:
     return np.sqrt(np.maximum(x, 0))
 
+def compute_motion_features(bboxes):
+        bboxes = copy(bboxes)
+        n = len(bboxes)
+        enhanced = np.zeros((n, 12))
+        enhanced[:, :4] = bboxes
+        
+        # Velocity (first-order difference)
+        if n > 1:
+            velocity = np.diff(bboxes, axis=0)
+            enhanced[1:, 4:8] = velocity
+            # First frame velocity = 0 (no previous frame)
+            
+        # Acceleration (second-order difference)
+        if n > 2:
+            acceleration = np.diff(velocity, axis=0)
+            enhanced[2:, 8:12] = acceleration
+            # First two frames acceleration = 0 (need at least 3 frames)
+            
+        return enhanced

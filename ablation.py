@@ -11,7 +11,7 @@ DATASET = 'DanceTrack'
 SPLIT = 'train'
 SEQS = None
 DETECTION_FOLDER = 'ocsort_x_dance'
-ABLATION_NAME = 'with_byte_and_lstm_base_noisy_trained'
+ABLATION_NAME = 'with_byte_and_transformer_motion_features_trained_update_window_60'
 
 
 def evaluate(dataset, split):
@@ -114,7 +114,8 @@ def run(seq):
     os.makedirs(f'ablation_results/{ABLATION_NAME}/log/ocsort-self', exist_ok=True)
     tracker = OCSORTTracker({
         'log_path': f'ablation_results/{ABLATION_NAME}/log/ocsort-self/{seq}.log',
-        'use_byte': True
+        'use_byte': True,
+        'update_window': 60
     })
     os.makedirs('outputs/ocsort-self', exist_ok=True)
     file = open(f'outputs/ocsort-self/{seq}.txt', 'w')

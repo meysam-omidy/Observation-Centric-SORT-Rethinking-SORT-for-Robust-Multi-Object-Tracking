@@ -31,10 +31,11 @@ def run(seq):
         'image_height': config['Sequence']['imHeight'],
         'association_speed_direction_coefficient': 0,
         'use_byte': True,
-        # 'log_path': 'file.log'
+        'log_path': 'file.log',
         # 'association_speed_direction_coefficient': 1
     })
     for frame_number in range(1, int(config['Sequence']['seqLength']) + 1):
+        print(frame_number)
         dets = detections[detections[:, 0] == frame_number][:, 1:]
         tracker.update(dets)
         for output in tracker.get_outputs():
