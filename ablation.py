@@ -7,9 +7,13 @@ import os
 import json
 import pickle
 
+# DATASET = 'MOT20'
 DATASET = 'DanceTrack'
-SPLIT = 'train'
-SEQS = None
+SPLIT = 'val'
+SEQS = ['dancetrack0035','dancetrack0041','dancetrack0043','dancetrack0047','dancetrack0058','dancetrack0063','dancetrack0065','dancetrack0073','dancetrack0077','dancetrack0079','dancetrack0081','dancetrack0090','dancetrack0094','dancetrack0097']
+# SEQS = None
+# DETECTION_FOLDER = 'ocsort_x_mot20'
+# DETECTION_FOLDER = 'bytetrack_x_mot17'
 DETECTION_FOLDER = 'ocsort_x_dance'
 ABLATION_NAME = 'with_byte_and_transformer_motion_features_trained_update_window_60'
 
@@ -62,6 +66,9 @@ def evaluate(dataset, split):
         os.makedirs(f'ablation_results/{ABLATION_NAME}/raw/{tracker_to_eval}', exist_ok=True)
         hota = np.mean(res['MotChallenge2DBox'][tracker_to_eval]['COMBINED_SEQ']['pedestrian']['HOTA']['HOTA']).item()
         idf1 = res['MotChallenge2DBox'][tracker_to_eval]['COMBINED_SEQ']['pedestrian']['Identity']['IDF1'].item()
+        idtp = res['MotChallenge2DBox'][tracker_to_eval]['COMBINED_SEQ']['pedestrian']['Identity']['IDTP'].item()
+        idfp = res['MotChallenge2DBox'][tracker_to_eval]['COMBINED_SEQ']['pedestrian']['Identity']['IDFP'].item()
+        idfn = res['MotChallenge2DBox'][tracker_to_eval]['COMBINED_SEQ']['pedestrian']['Identity']['IDFN'].item()
         mota = res['MotChallenge2DBox'][tracker_to_eval]['COMBINED_SEQ']['pedestrian']['CLEAR']['MOTA'].item()
         motp = res['MotChallenge2DBox'][tracker_to_eval]['COMBINED_SEQ']['pedestrian']['CLEAR']['MOTP'].item()
         assa = np.mean(res['MotChallenge2DBox'][tracker_to_eval]['COMBINED_SEQ']['pedestrian']['HOTA']['AssA']).item()
@@ -78,6 +85,9 @@ def evaluate(dataset, split):
                 'MOTA': mota,
                 'MOTP': motp,
                 'IDF1': idf1,
+                'IDTP': idtp,
+                'IDFP': idfp,
+                'IDFN': idfn,
                 'IDSW': idsw,
                 'HOTA': hota,
                 'FP': fp,
@@ -92,6 +102,9 @@ def evaluate(dataset, split):
             file.write(f'FN:      {fn}\n')
             file.write(f'IDSW:    {idsw}\n')
             file.write(f'IDF1:    {idf1}\n')
+            file.write(f'IDTP:    {idtp}\n')
+            file.write(f'IDFP:    {idfp}\n')
+            file.write(f'IDFN:    {idfn}\n')
             file.write(f'MT:      {mt}\n')
             file.write(f'ML:      {ml}\n')
             file.write(f'HOTA:    {hota}\n')

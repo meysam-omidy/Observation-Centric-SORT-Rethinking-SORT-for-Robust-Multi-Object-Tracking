@@ -5,8 +5,8 @@ import os
 
 @count_time
 def evaluate(dataset, split):
-    # trackers_to_eval = ['ocsort-self', 'oc-sort']
-    trackers_to_eval = ['ocsort-self', 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt']
+    trackers_to_eval = ['ocsort-self', 'oc-sort']
+    # trackers_to_eval = ['ocsort-self', 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt']
     # trackers_to_eval = 'cbiou'
 
     eval_config = {'USE_PARALLEL': True,

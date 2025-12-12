@@ -1,6 +1,6 @@
 from track import Track, TrackHistoryItem
 from track_state import TrackState, StateUnconfirmed, StateTracking, StateLost, StateDeleted
-from utils import select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features, get_dict_item, BBOX
+from utils import select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features, get_dict_item, BBOX, batch_ciou
 from pydantic import BaseModel
 from motion_predictor import device as DEVICE, model as MODEL
 import numpy as np
@@ -9,7 +9,8 @@ import logging
 
 class OCSORTTrackerConfig(BaseModel):
     max_age : int = 30
-    update_window : int = 30
+    update_window_start : int = 20
+    update_window_end : int = 50
     min_box_area : int = 100
     max_aspect_ratio : float = 1.6
     delta_t : int = 3
@@ -46,7 +47,6 @@ class OCSORTTracker:
             self.logger = None
 
     def update(self, boxes): 
-        self.frame_number += 1
         self.predict_tracks()
 
         if self.config.log_path:
@@ -121,47 +121,53 @@ class OCSORTTracker:
         self.id_counter += 1
 
     def predict_tracks(self):
+        self.frame_number += 1
+        frame_counts = [-1]
+        for track in self.get_tracks([StateTracking, StateLost, StateUnconfirmed]):
+            track.predict()
+            frame_counts.append(min(self.config.update_window_end, track.frame_count))
+        max_len = max(frame_counts)
+
         tracks = []
         srcs = []
-        for track in self.tracks:
-            if track.state != StateDeleted:
-                track.predict()
-                k_last_updates = track.k_last_updates
-                if len(k_last_updates) == 1:
-                    track.history.predict[track.current_frame] = k_last_updates[0]
-                elif len(k_last_updates) < self.config.update_window:
-                    diffs = []
-                    for i in range(1, len(k_last_updates)):
-                        diffs.append(k_last_updates[i].bbox - k_last_updates[i - 1].bbox)
-                    track.history.predict[track.current_frame] = TrackHistoryItem(
-                        np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox, 
-                        1
-                    )
-                else:
-                    boxes = np.array([k_last_update.bbox for k_last_update in k_last_updates])
-                    scores = np.array([k_last_update.score for k_last_update in k_last_updates])
-                    boxes[:, 0] /= self.config.image_width
-                    boxes[:, 1] /= self.config.image_height
-                    boxes[:, 2] /= self.config.image_width
-                    boxes[:, 3] /= self.config.image_height
-                    src = np.zeros(shape=(len(boxes), 13))
-                    src[:, :12] = compute_motion_features(boxes)
-                    src[:, 12] = scores
-                    tracks.append(track)
-                    srcs.append(src)
+        frame_counts = []
+        for track in self.get_tracks([StateTracking, StateLost, StateUnconfirmed]):
+            k_last_updates = track.k_last_updates
+            if len(k_last_updates) == 1:
+                track.history.predict[track.current_frame] = k_last_updates[0]
+            elif len(k_last_updates) < self.config.update_window_start:
+                diffs = []
+                for i in range(1, len(k_last_updates)):
+                    diffs.append(k_last_updates[i].bbox - k_last_updates[i - 1].bbox)
+                track.history.predict[track.current_frame] = TrackHistoryItem(
+                    np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox, 
+                    1
+                )
+            else:
+                boxes = np.array([k_last_update.bbox for k_last_update in k_last_updates])
+                scores = np.array([k_last_update.score for k_last_update in k_last_updates])
+                boxes[:, 0] /= self.config.image_width
+                boxes[:, 1] /= self.config.image_height
+                boxes[:, 2] /= self.config.image_width
+                boxes[:, 3] /= self.config.image_height
+                src = np.zeros(shape=(max_len, 13))
+                src[:len(boxes), :12] = compute_motion_features(boxes)
+                src[:len(boxes), 12] = scores
+                tracks.append(track)
+                srcs.append(src)
+                frame_counts.append(min(self.config.update_window_end, track.frame_count))
         if len(tracks) > 0:
             srcs = np.array(srcs)
             srcs = torch.tensor(srcs, dtype=torch.float32).to(DEVICE).reshape(srcs.shape[0], srcs.shape[1], -1)
-            # trgs = srcs[:, -1:, :]
-            with torch.no_grad():
-                preds = MODEL.forward(srcs[:, :-1, :], srcs[:, -1:, :]).reshape(srcs.shape[0], 5).cpu().numpy()
-            # preds = MODEL.inference(srcs, trgs, 1).reshape(srcs.shape[0], 4).cpu().numpy()
+            o = MODEL.inference(srcs, frame_counts)
+            preds = np.zeros(shape=(len(tracks), 5))
+            for i, track in enumerate(tracks):
+                preds[i] = o[i, frame_counts[i] - 1].cpu().numpy()
             preds[:, 0] *= self.config.image_width 
             preds[:, 1] *= self.config.image_height
             preds[:, 2] *= self.config.image_width
             preds[:, 3] *= self.config.image_height
             for i, track in enumerate(tracks):
-                # track.history.predict[track.current_frame] = preds[i]
                 track.history.predict[track.current_frame] = TrackHistoryItem(
                     BBOX(preds[i][:4]),
                     float(preds[i][4].item())
@@ -181,7 +187,6 @@ class OCSORTTracker:
             s, a = track.bbox.to_xysa()[2:]
             if all([
                 track.state in [StateTracking],
-                # track.state == StateTracking,
                 s >= self.config.min_box_area,
                 a <= self.config.max_aspect_ratio
             ]):
@@ -197,7 +202,6 @@ class OCSORTTracker:
         track_speed_directions = np.array([t.speed_direction for t in tracks])
         track_speed_directions = track_speed_directions.repeat(len(detections)).reshape(-1, len(detections))
         track_tlbrs = np.array([t.bbox.to_tlbr() for t in tracks])
-        # track_tlbrs = np.array([t.bbox.to_tlbr() for t in tracks])
         track_previous_obs = np.array([t.k_last_observation for t in tracks])
         speed_directions = batch_speed_direction(track_previous_obs, detections)
         speed_directions_cost = np.abs(speed_directions - track_speed_directions)
@@ -224,7 +228,7 @@ class OCSORTTracker:
             unmatched_track_ids = [track_ids[i] for i in unmatched_tracks]
             matched_tracks_ = [[track_ids[i], j+1] for i,j in matched_tracks]
             unmatched_detections_ = [i+1 for i in unmatched_detections]
-            matchs_to_remove_ = [[track_ids[i], j] for i,j in matchs_to_remove]
+            matchs_to_remove_ = [[track_ids[i], j+1] for i,j in matchs_to_remove]
             text = f'PHASE {phase}'
             self.logger.info(f'{"*" * int((150 - len(text)) / 2)}  {text}  {"*" * int((150 - len(text)) / 2)}')
             self.logger.info(f'tracks')

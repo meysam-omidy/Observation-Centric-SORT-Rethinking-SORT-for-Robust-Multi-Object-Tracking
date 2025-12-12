@@ -90,13 +90,20 @@ class MotionTransformer(nn.Module):
         ], dim=-1)
 
     @torch.no_grad()
-    def inference(self, src, trg, num_steps=1):
-        preds = []
-        for t in range(num_steps):
-            trg_ = torch.cat([trg[:, 0:1, :]] + preds, dim=1)
-            out = self.forward(src, trg_)
-            preds.append(out[:, -1:, :])
-        return torch.cat(preds, dim=1)
+    def inference(self, src, frame_counts):
+        enc_emb = self.pos_enc(self.in_fc(src) * math.sqrt(self.d_model))
+        mask = torch.zeros(size=(src.size(0), src.size(1), src.size(1))).to(src.device).bool()
+        for i in range(src.size(0)):
+            mask[i] = self._mask(frame_counts[i], src.size(1) - frame_counts[i], src.device)
+        # print('mask', mask)
+
+
+        out = self.transformer.forward(enc_emb)
+        pred = self.out_fc(out)
+        return torch.concat([
+            src[:, :, :4] + pred[:, :, :4],
+            nn.functional.sigmoid(pred[:, :, 4:])
+        ], dim=-1)
     
     def train_one_epoch(self, dataloader, optimizer, criterion, device='cuda'):
         self.train()
@@ -153,6 +160,12 @@ model = MotionTransformer(
     nhead=16,
     num_layers=6,
     dim_ff=512,
-    dropout=0.1,
+    # dropout=0.1,
 ).to(device)
 model.load_weight('motion_model_weights/transformer-encoder-d256-ff512-6l-ft.pth')
+# seed = 15
+# torch.manual_seed(seed)
+
+# # PyTorch CUDA RNG (if used)
+# torch.cuda.manual_seed(seed)
+# torch.cuda.manual_seed_all(seed)

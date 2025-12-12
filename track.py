@@ -7,7 +7,8 @@ from typing import Union
 
 class TrackConfig(BaseModel):
     max_age : int = 30
-    update_window : int = 30
+    update_window_start : int = 3
+    update_window_end : int = 6
     delta_t : int = 3
     image_width : int = 1920
     image_height : int = 1080
@@ -109,7 +110,7 @@ class Track:
     @property
     def k_last_updates(self) -> list:
         k_last = []
-        for i in range(self.current_frame - self.config.update_window, self.current_frame):
+        for i in range(self.current_frame - self.config.update_window_end, self.current_frame):
             if i in self.history.update:
                 k_last.append(self.history.update[i])
             elif i in self.history.predict:
@@ -124,7 +125,6 @@ class Track:
     def mot_format(self) -> str:
         tlwh = get_dict_item(self.history.update, -1).bbox.to_tlwh()
         return (
-            # f"{{frame_number}},"
             f"{self.current_frame},"
             f"{int(self.id)},"
             f"{round(tlwh[0], 1)},"
