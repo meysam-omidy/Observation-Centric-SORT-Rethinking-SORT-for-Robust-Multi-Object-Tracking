@@ -95,4 +95,5 @@ def evaluate(dataset, split):
         file.close()
 
 if __name__ == '__main__':
-    evaluate('DanceTrack', 'val')
+    evaluate('MOT20', 'val')
+    # evaluate('DanceTrack', 'val')

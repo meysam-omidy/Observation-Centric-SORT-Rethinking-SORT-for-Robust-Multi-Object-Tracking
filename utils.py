@@ -61,24 +61,6 @@ def select_indices(arr, indices):
 def get_dict_item(obj:dict, index:int):
     values = list(obj.values())
     return values[index]
-
-def get_r_matrix(c):
-    with open('config/r.pickle', 'rb') as f:
-    # with open('config/r.pickle', 'rb') as f:
-        r_dict = pickle.load(f)
-        c_keys = np.array(list(r_dict.keys()))
-        c_dists = np.abs(c_keys - c)
-        nearest_c =c_keys[c_dists.argmin()]
-        return r_dict[nearest_c]
-
-def get_p_matrix(c):
-    with open('config/p.pickle', 'rb') as f:
-    # with open('config/p.pickle', 'rb') as f:
-        p_dict = pickle.load(f)
-        c_keys = np.array(list(p_dict.keys()))
-        c_dists = np.abs(c_keys - c)
-        nearest_c =c_keys[c_dists.argmin()]
-        return p_dict[nearest_c]
     
 def print_matrix(x, precision=3):
     print(np.array2string(x, precision=precision, suppress_small=True))

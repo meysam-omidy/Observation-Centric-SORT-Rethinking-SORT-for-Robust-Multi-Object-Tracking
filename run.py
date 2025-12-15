@@ -6,16 +6,17 @@ import configparser
 import os
 import concurrent.futures
 
-# DATASET = 'MOT20'
-DATASET = 'MOT17'
+DATASET = 'MOT20'
+# DATASET = 'MOT17'
 # DATASET = 'DanceTrack'
 SPLIT = 'val'
 # SEQS = seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
 SEQS = None
 # SEQS = ['MOT17-02-FRCNN']
+SEQS = ['MOT20-01']
 # SEQS = ['dancetrack0079']
-# DETECTION_FOLDER = 'ocsort_x_mot20'
-DETECTION_FOLDER = 'bytetrack_x_mot17'
+DETECTION_FOLDER = 'ocsort_x_mot20'
+# DETECTION_FOLDER = 'bytetrack_x_mot17'
 # DETECTION_FOLDER = 'ocsort_x_dance'
 
 @count_time
@@ -30,6 +31,7 @@ def run(seq):
         # 'high_score_det_threshold': 0.5,
         'image_width': config['Sequence']['imWidth'],
         'image_height': config['Sequence']['imHeight'],
+        # 'update_window_start': 30,
         'association_speed_direction_coefficient': 0,
         'use_byte': True,
         # 'log_path': 'file.log',

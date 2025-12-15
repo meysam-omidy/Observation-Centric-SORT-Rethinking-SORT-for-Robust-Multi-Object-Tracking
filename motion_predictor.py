@@ -157,11 +157,15 @@ model = MotionTransformer(
     input_dim=13,
     output_dim=5,
     d_model=256,
+    # nhead=32,
     nhead=16,
+    # num_layers=1,
     num_layers=6,
     dim_ff=512,
+    dropout=0
     # dropout=0.1,
 ).to(device)
+# model.load_weight('motion_model_weights/transformer-encoder-d256-ff512-nh32-1l-n5.pth')
 model.load_weight('motion_model_weights/transformer-encoder-d256-ff512-6l-ft.pth')
 # seed = 15
 # torch.manual_seed(seed)

@@ -1,6 +1,6 @@
 from track import Track, TrackHistoryItem
 from track_state import TrackState, StateUnconfirmed, StateTracking, StateLost, StateDeleted
-from utils import select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features, get_dict_item, BBOX, batch_ciou
+from utils import select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features, get_dict_item, BBOX
 from pydantic import BaseModel
 from motion_predictor import device as DEVICE, model as MODEL
 import numpy as np
@@ -70,7 +70,7 @@ class OCSORTTracker:
         for t_i, d_i in matches:
             confirmed_tracks[t_i].update(
                 high_confidence_detections[d_i], 
-                score=high_scores[d_i]
+                score=float(high_scores[d_i])
             )
 
         if self.config.use_byte:
@@ -86,7 +86,7 @@ class OCSORTTracker:
             for t_i, d_i in matches:
                 remained_tracking_tracks[t_i].update(
                     low_confidence_detections[d_i], 
-                    score=low_scores[d_i]
+                    score=float(low_scores[d_i])
                 )
 
         remained_high_confidence_detections = select_indices(high_confidence_detections, unmatched_high_confidence_detection_indices)
@@ -102,7 +102,7 @@ class OCSORTTracker:
         for t_i, d_i in matches:
             unconfirmed_tracks[t_i].update(
                 remained_high_confidence_detections[d_i], 
-                score=remained_high_scores[d_i]
+                score=float(remained_high_scores[d_i])
             )
         
         unmatched_remained_high_score_detections = select_indices(remained_high_confidence_detections, unmatched_remained_high_score_detection_indices)
@@ -141,7 +141,7 @@ class OCSORTTracker:
                     diffs.append(k_last_updates[i].bbox - k_last_updates[i - 1].bbox)
                 track.history.predict[track.current_frame] = TrackHistoryItem(
                     np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox, 
-                    1
+                    track.score
                 )
             else:
                 boxes = np.array([k_last_update.bbox for k_last_update in k_last_updates])
