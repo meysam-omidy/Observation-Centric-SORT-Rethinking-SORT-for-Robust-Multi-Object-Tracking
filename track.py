@@ -1,9 +1,9 @@
 import numpy as np
 import textwrap
 from track_state import StateUnconfirmed, StateTracking, StateLost, StateDeleted, TrackState
-from utils import BBOX, get_dict_item, batch_speed_direction
+from utils import BBOX, get_dict_item, get_dict_key, batch_speed_direction
 from pydantic import BaseModel
-from typing import Union
+from typing import Union, Literal
 
 class TrackConfig(BaseModel):
     max_age : int = 30
@@ -12,16 +12,22 @@ class TrackConfig(BaseModel):
     delta_t : int = 3
     image_width : int = 1920
     image_height : int = 1080
+    reupdate_type : Literal['constant', 'relative', None] = None
+    reupdate_constant_weight : float = 1
 
 
 class TrackHistoryItem:
-    def __init__(self, bbox : BBOX, score: float):
+    def __init__(self, bbox : BBOX, score: float, type : str = None):
         self.bbox = bbox
-        self.score = score
+        self.score = float(score)
+        self.type = type
 
     def __repr__(self):
-        return repr((self.bbox, self.score))
-
+        if self.type is not None:
+            return repr((self.bbox, self.score, self.type))
+        else:
+            return repr((self.bbox, self.score))
+        
 
 class TrackHistory:
     def __init__(self):
@@ -80,28 +86,6 @@ class Track:
     
     def __repr__(self):
         return repr(self.compressed_format)
-
-    def predict(self):
-        self.age += 1
-        self.frame_count += 1
-        if self.state == StateTracking and self.age >= 2:
-            self.state = StateLost
-        self.history.state[self.current_frame] = self.state.name
-            
-    def update(self, 
-               bbox : Union[list, np.ndarray], 
-               score : float):
-        self.history.update[self.current_frame] = TrackHistoryItem(
-            BBOX.from_tlbr(bbox),
-            score
-        )
-        self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
-        self.age = 0
-        if self.state == StateUnconfirmed:
-            self.state = StateTracking
-        if self.state == StateLost:
-            self.state = StateTracking
-            self.last_state = None
 
     @property
     def bbox(self) -> BBOX:
@@ -185,7 +169,8 @@ class Track:
     def speed_direction(self) -> np.float64:
         if len(self.history.update) < 2:
             return np.float64(0)
-        bbox_last = self.bbox.to_tlbr().reshape(1, 4)
+        bbox_last = get_dict_item(self.history.update, -1).bbox.to_tlbr()
+        # bbox_last = self.bbox.to_tlbr().reshape(1, 4)
         bbox_k_last = self.k_last_observation.reshape(1, 4)
         return batch_speed_direction(bbox_k_last, bbox_last)[0,0]
 
@@ -200,3 +185,55 @@ class Track:
             return False
         else:
             return True
+        
+    def predict(self):
+        self.age += 1
+        self.frame_count += 1
+        if self.state == StateTracking and self.age >= 2:
+            self.state = StateLost
+        self.history.state[self.current_frame] = self.state.name
+            
+    def update(self, 
+               bbox : Union[list, np.ndarray], 
+               score : float):
+        require_reupdate = False
+        if self.age > 1:
+            require_reupdate = True
+        self.history.update[self.current_frame] = TrackHistoryItem(
+            BBOX.from_tlbr(bbox),
+            score
+        )
+        self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
+        self.age = 0
+        if self.state == StateUnconfirmed:
+            self.state = StateTracking
+        if self.state == StateLost:
+            self.state = StateTracking
+            self.last_state = None
+        if require_reupdate and self.config.reupdate_type is not None:
+            self.reupdate()
+
+    def reupdate(self):
+        new_frame_index = get_dict_key(self.history.update, -1)
+        last_frame_index = get_dict_key(self.history.update, -2)
+        boxes = np.linspace(
+            get_dict_item(self.history.update, -2).bbox, 
+            get_dict_item(self.history.update, -1).bbox, 
+            new_frame_index - last_frame_index + 1
+        )
+        if self.config.reupdate_type == 'constant':
+            scores = [self.config.reupdate_constant_weight for _ in range(len(boxes))]
+        else:
+            scores = np.linspace(
+                get_dict_item(self.history.update, -2).score, 
+                get_dict_item(self.history.update, -1).score, 
+                new_frame_index - last_frame_index + 1
+            )
+        for i in range(new_frame_index - last_frame_index + 1):
+            self.history.update[last_frame_index + i] = TrackHistoryItem(boxes[i], scores[i], 'virtual')
+
+
+
+
+
+        

@@ -3,6 +3,7 @@ from track_state import TrackState, StateUnconfirmed, StateTracking, StateLost, 
 from utils import select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features, get_dict_item, BBOX
 from pydantic import BaseModel
 from motion_predictor import device as DEVICE, model as MODEL
+from typing import Literal
 import numpy as np
 import torch
 import logging
@@ -26,6 +27,8 @@ class OCSORTTrackerConfig(BaseModel):
     image_height : int = 1080
     use_byte : bool = False
     log_path : str = None
+    reupdate_type : Literal['constant', 'relative', None] = None
+    reupdate_constant_weight : float = 1
     
 
 class OCSORTTracker:
@@ -180,6 +183,10 @@ class OCSORTTracker:
 
     def get_tracks(self, included_states : list[TrackState] = []):
         return [track for track in self.tracks if track.state in included_states]
+    
+    def show_tracks(self):
+        for t in self.tracks:
+            print(t.clean_format)
 
     def get_outputs(self):
         outputs = []
