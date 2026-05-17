@@ -1,7 +1,8 @@
 import numpy as np
 import textwrap
 from track_state import StateUnconfirmed, StateTracking, StateLost, StateDeleted, TrackState
-from utils import BBOX, get_dict_item, get_dict_key, batch_speed_direction
+from utils import BBOX, get_dict_item, get_dict_key, batch_speed_direction, tlbr_to_z, bbox_xywh_to_z, z_to_bbox_xywh
+from kalman_filter import create_sort_kalman, learned_measurement_noise_matrix, learned_process_noise_matrix
 from pydantic import BaseModel
 from typing import Union, Literal
 
@@ -14,19 +15,23 @@ class TrackConfig(BaseModel):
     image_height : int = 1080
     reupdate_type : Literal['constant', 'relative', None] = None
     reupdate_constant_weight : float = 1
+    use_kalman : bool = True
+    kalman_fusion_blend : float = 1.0
 
 
 class TrackHistoryItem:
-    def __init__(self, bbox : BBOX, score: float, type : str = None):
+    def __init__(self, bbox : BBOX, score: float, type : str = None,
+                 var_q: np.ndarray = None, var_r: np.ndarray = None):
         self.bbox = bbox
         self.score = float(score)
         self.type = type
+        self.var_q = None if var_q is None else np.asarray(var_q, dtype=float)
+        self.var_r = None if var_r is None else np.asarray(var_r, dtype=float)
 
     def __repr__(self):
         if self.type is not None:
-            return repr((self.bbox, self.score, self.type))
-        else:
-            return repr((self.bbox, self.score))
+            return repr((self.bbox, self.score, self.type, self.var_q, self.var_r))
+        return repr((self.bbox, self.score, self.var_q, self.var_r))
         
 
 class TrackHistory:
@@ -80,6 +85,10 @@ class Track:
             'max_time_lost': 0
         }
         self.id = id
+        if self.config.use_kalman:
+            self.kf = create_sort_kalman(np.asarray(bbox, dtype=float), float(score))
+        else:
+            self.kf = None
 
     def __str__(self):
         return self.clean_format
@@ -186,6 +195,46 @@ class Track:
         else:
             return True
         
+    def set_prediction_from_motion(
+        self,
+        xywh: np.ndarray,
+        score: float,
+        var_q: np.ndarray = None,
+        var_r: np.ndarray = None,
+    ):
+        """
+        Kalman predict with optional learned Q, then fuse network xywh into the
+        measurement sub-state (linear velocity retained from F).
+        """
+        xywh = np.asarray(xywh, dtype=float).reshape(4)
+        if self.kf is None or not self.config.use_kalman:
+            self.history.predict[self.current_frame] = TrackHistoryItem(
+                BBOX(xywh.copy()),
+                float(score),
+                var_q=var_q,
+                var_r=var_r,
+            )
+            return
+        Q = None
+        if var_q is not None:
+            Q = learned_process_noise_matrix(
+                var_q,
+                xywh,
+                self.config.image_width,
+                self.config.image_height,
+            )
+        self.kf.predict(Q=Q)
+        z_nn = bbox_xywh_to_z(xywh)
+        b = float(np.clip(self.config.kalman_fusion_blend, 0.0, 1.0))
+        self.kf.x[:4] = (1.0 - b) * self.kf.x[:4] + b * z_nn
+        xywh_kf = z_to_bbox_xywh(self.kf.x[:4])
+        self.history.predict[self.current_frame] = TrackHistoryItem(
+            BBOX(np.asarray(xywh_kf, dtype=float)),
+            float(score),
+            var_q=var_q,
+            var_r=var_r,
+        )
+        
     def predict(self):
         self.age += 1
         self.frame_count += 1
@@ -203,6 +252,21 @@ class Track:
             BBOX.from_tlbr(bbox),
             score
         )
+        if self.kf is not None:
+            z = tlbr_to_z(bbox)
+            pred_item = self.history.predict.get(self.current_frame)
+            var_r = pred_item.var_r if pred_item is not None else None
+            if var_r is not None:
+                xywh_obs = BBOX.from_tlbr(bbox)
+                R = learned_measurement_noise_matrix(
+                    var_r,
+                    xywh_obs,
+                    self.config.image_width,
+                    self.config.image_height,
+                )
+                self.kf.update(z, R=R)
+            else:
+                self.kf.update(z)
         self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
         self.age = 0
         if self.state == StateUnconfirmed:

@@ -1,175 +1,130 @@
-import math, torch, torch.nn as nn
-import torch.nn.functional as F
-import random
 import os
+from typing import Literal, Optional
 
-# ---------- positional encoding ----------
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)                       # (1,L,D)
-        self.register_buffer('pe', pe)
+import numpy as np
+import torch
+from pydantic import BaseModel, Field
 
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+from motion_learned import ImprovedLSTMLearnedNoise, MotionTransformerLearnedNoise, softplus_var
+from motion_lstm import ImprovedLSTMPredictor
+from motion_transformer import MotionTransformer
 
-# ---------- encoder–decoder transformer ----------
-class MotionTransformer(nn.Module):
-    def __init__(self, 
-                 input_dim=13,  # Updated default: 12 motion features + 1 confidence
-                 output_dim=5,
-                 d_model=256,   # Increased from 128 for more capacity
-                 nhead=8,
-                 num_layers=6,  # Increased from 3 for complex motion patterns
-                 dim_ff=1024,   # Increased from 512
-                 dropout=0.1,
-    ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.d_model = d_model
-        
-        # Deeper input embedding network
-        self.in_fc = nn.Sequential(
-            nn.Linear(input_dim, d_model // 4),
-            nn.LayerNorm(d_model // 4),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 4, d_model // 2),
-            nn.LayerNorm(d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 2, d_model)
-        )
-        self.pos_enc = PositionalEncoding(d_model)
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer=nn.TransformerEncoderLayer(
-                d_model=d_model, 
-                nhead=nhead,
-                dim_feedforward=dim_ff,
-                batch_first=True,
-                dropout=dropout,
-                activation='gelu',
-            ),
-            mask_check=False,
-            num_layers=num_layers,
-            norm=nn.LayerNorm(d_model)
-        )
-        # Deeper output network
-        self.out_fc = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.LayerNorm(d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 2, d_model // 4),
-            nn.LayerNorm(d_model // 4),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 4, output_dim)
-        )
 
-    @staticmethod
-    def _mask(src_size, trg_size, device):
-        mask = torch.triu(torch.ones(src_size + trg_size, src_size + trg_size, device=device), diagonal=1)
-        mask[:, :src_size] = 0
-        return mask.bool()
+class MotionPredictorConfig(BaseModel):
+    enabled: bool = False
+    model_type: Literal['transformer', 'transformer_learned', 'lstm', 'lstm_learned'] = (
+        'transformer_learned'
+    )
+    weights_path: str = 'motion_model_weights/phase2_transformer_learned.pth'
+    device: Optional[str] = Field(
+        default=None,
+        description='cuda | cpu | mps; None = auto (cuda if torch.cuda.is_available())',
+    )
+    d_model: int = 256
+    nhead: int = 8
+    num_layers: int = 6
+    dim_ff: int = 1024
+    dropout: float = 0.1
+    lstm_hidden_dim: int = 256
+    lstm_num_layers: int = 2
+    use_kalman: bool = True
+    kalman_fusion_blend: float = 1.0
 
-    def forward(self, src, trg):
-        input_tensor = torch.cat([src, trg], dim=1)
-        enc_emb = self.pos_enc(self.in_fc(input_tensor) * math.sqrt(self.d_model))
-        mask = self._mask(src.size(1), trg.size(1), input_tensor.device)
-        out = self.transformer.forward(enc_emb, mask=mask)
-        pred = self.out_fc(out[:, -trg.size(1):, :])
-        return torch.concat([
-            trg[:, :, :4] + pred[:, :, :4],
-            nn.functional.sigmoid(pred[:, :, 4:])
-        ], dim=-1)
+
+def _resolve_device(cfg: MotionPredictorConfig) -> torch.device:
+    if cfg.device is not None:
+        return torch.device(cfg.device)
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
+def build_model(cfg: MotionPredictorConfig, device: torch.device) -> torch.nn.Module:
+    t_kw = dict(
+        input_dim=13,
+        d_model=cfg.d_model,
+        nhead=cfg.nhead,
+        num_layers=cfg.num_layers,
+        dim_ff=cfg.dim_ff,
+        dropout=cfg.dropout,
+    )
+    if cfg.model_type == 'transformer':
+        return MotionTransformer(output_dim=5, **t_kw).to(device)
+    if cfg.model_type == 'transformer_learned':
+        return MotionTransformerLearnedNoise(**t_kw).to(device)
+    if cfg.model_type == 'lstm':
+        return ImprovedLSTMPredictor(
+            input_dim=13,
+            output_dim=5,
+            d_model=cfg.d_model,
+            hidden_dim=cfg.lstm_hidden_dim,
+            num_layers=cfg.lstm_num_layers,
+            dropout=cfg.dropout,
+        ).to(device)
+    if cfg.model_type == 'lstm_learned':
+        return ImprovedLSTMLearnedNoise(
+            input_dim=13,
+            d_model=cfg.d_model,
+            hidden_dim=cfg.lstm_hidden_dim,
+            num_layers=cfg.lstm_num_layers,
+            dropout=cfg.dropout,
+        ).to(device)
+    raise ValueError(cfg.model_type)
+
+
+class MotionPredictorEngine:
+    """Loads a phase-2 motion model and runs one-step autoregressive prediction."""
+
+    def __init__(self, cfg: MotionPredictorConfig):
+        self.cfg = cfg
+        self.device = _resolve_device(cfg)
+        if not os.path.isfile(cfg.weights_path):
+            raise FileNotFoundError(
+                f'Motion predictor weights not found: {cfg.weights_path}'
+            )
+        self.model = build_model(cfg, self.device)
+        self.model.load_weight(cfg.weights_path, map_location=str(self.device))
+        self.model.eval()
 
     @torch.no_grad()
-    def inference(self, src, frame_counts):
-        enc_emb = self.pos_enc(self.in_fc(src) * math.sqrt(self.d_model))
-        mask = torch.zeros(size=(src.size(0), src.size(1), src.size(1))).to(src.device).bool()
-        for i in range(src.size(0)):
-            mask[i] = self._mask(frame_counts[i], src.size(1) - frame_counts[i], src.device)
-        # print('mask', mask)
+    def predict_batch(
+        self,
+        src: np.ndarray,
+        valid_lens: list[int],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        :param src: (B, T, 13) float32, normalized xywh motion features + detection score
+        :param valid_lens: valid timesteps per row (rest is padding)
+        :return: pred (B, 5) xywh + conf in normalized space; var_q, var_r (B, 4) or None
+        """
+        t = torch.as_tensor(src, dtype=torch.float32, device=self.device)
+        B, T, _ = t.shape
+        pad = torch.zeros(B, T, dtype=torch.bool, device=self.device)
+        for i, L in enumerate(valid_lens):
+            if L < T:
+                pad[i, L:] = True
+        idx = torch.tensor(valid_lens, device=self.device, dtype=torch.long) - 1
+        trg0 = t[torch.arange(B, device=self.device), idx].unsqueeze(1)
 
-
-        out = self.transformer.forward(enc_emb)
-        pred = self.out_fc(out)
-        return torch.concat([
-            src[:, :, :4] + pred[:, :, :4],
-            nn.functional.sigmoid(pred[:, :, 4:])
-        ], dim=-1)
-    
-    def train_one_epoch(self, dataloader, optimizer, criterion, device='cuda'):
-        self.train()
-        total_loss = 0
-
-        for src, trg, gt_src, gt_trg in dataloader:
-            src = src.to(device)
-            trg = trg.to(device)
-            gt_src = gt_src.to(device)
-            gt_trg = gt_trg.to(device)
-
-            optimizer.zero_grad()
-            output = self.forward(src, trg[:, :-1])
-
-            loss = criterion(output, gt_trg[:, 1:])
-            loss.backward()
-            # torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        return total_loss / len(dataloader)
-
-
-    def evaluate(self, dataloader, criterion, device='cuda'):
-        self.eval()
-        total_loss = 0
-
-        with torch.no_grad():
-            for src, trg, gt_src, gt_trg in dataloader:
-                src = src.to(device)
-                trg = trg.to(device)
-                gt_src = gt_src.to(device)
-                gt_trg = gt_trg.to(device)
-                output = self.forward(src, trg[:, :-1])
-                loss = criterion(output, gt_trg[:, 1:])
-                total_loss += loss.item()
-
-        return total_loss / len(dataloader)
-    
-    def save_weight(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(self.state_dict(), path)
-
-    def load_weight(self, path):
-        self.load_state_dict(torch.load(path, map_location='cuda', weights_only=True))
-
-
-device = 'cuda'
-model = MotionTransformer(
-    input_dim=13,
-    output_dim=5,
-    d_model=256,
-    # nhead=32,
-    nhead=16,
-    # num_layers=1,
-    num_layers=6,
-    dim_ff=512,
-    dropout=0
-    # dropout=0.1,
-).to(device)
-# model.load_weight('motion_model_weights/transformer-encoder-d256-ff512-nh32-1l-n5.pth')
-model.load_weight('motion_model_weights/transformer-encoder-d256-ff512-6l-ft.pth')
-# seed = 15
-# torch.manual_seed(seed)
-
-# # PyTorch CUDA RNG (if used)
-# torch.cuda.manual_seed(seed)
-# torch.cuda.manual_seed_all(seed)
+        mt = self.cfg.model_type
+        if mt == 'transformer':
+            out = self.model.inference(
+                t, trg0, num_steps=1, src_key_padding_mask=pad
+            )
+            return out[:, 0, :], None, None
+        if mt == 'transformer_learned':
+            pred, lq, lr = self.model.inference(
+                t, trg0, num_steps=1, src_key_padding_mask=pad
+            )
+            vq = softplus_var(lq[:, 0, :])
+            vr = softplus_var(lr[:, 0, :])
+            return pred[:, 0, :], vq, vr
+        if mt == 'lstm':
+            out = self.model.inference(t, trg0, num_steps=1)
+            return out[:, 0, :], None, None
+        if mt == 'lstm_learned':
+            pred, lq, lr = self.model.inference(t, trg0, num_steps=1)
+            vq = softplus_var(lq[:, 0, :])
+            vr = softplus_var(lr[:, 0, :])
+            return pred[:, 0, :], vq, vr
+        raise ValueError(mt)

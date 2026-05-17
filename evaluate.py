@@ -3,6 +3,8 @@ from utils import count_time
 import numpy as np
 import os
 
+DATASETS_DIR = 'D://Projects/.Datasets/'
+
 @count_time
 def evaluate(dataset, split):
     # trackers_to_eval = ['ocsort-self', 'oc-sort']
@@ -26,7 +28,7 @@ def evaluate(dataset, split):
                     'OUTPUT_DETAILED': False,
                     'PLOT_CURVES': False}
 
-    dataset_config = {'GT_FOLDER': f'../../.Datasets/{dataset}/{split}/',
+    dataset_config = {'GT_FOLDER': f'{DATASETS_DIR}/{dataset}/{split}/',
                         'TRACKERS_FOLDER': 'outputs',
                         'OUTPUT_FOLDER': None,
                         'TRACKERS_TO_EVAL': trackers_to_eval,

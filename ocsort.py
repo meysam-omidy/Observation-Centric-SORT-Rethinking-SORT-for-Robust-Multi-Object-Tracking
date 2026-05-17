@@ -1,11 +1,10 @@
-from track import Track, TrackHistoryItem
+from track import Track
 from track_state import TrackState, StateUnconfirmed, StateTracking, StateLost, StateDeleted
 from utils import select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features, get_dict_item, BBOX
-from pydantic import BaseModel
-from motion_predictor import device as DEVICE, model as MODEL
+from pydantic import BaseModel, Field
+from motion_predictor import MotionPredictorConfig, MotionPredictorEngine
 from typing import Literal
 import numpy as np
-import torch
 import logging
 
 class OCSORTTrackerConfig(BaseModel):
@@ -29,6 +28,7 @@ class OCSORTTrackerConfig(BaseModel):
     log_path : str = None
     reupdate_type : Literal['constant', 'relative', None] = None
     reupdate_constant_weight : float = 1
+    motion : MotionPredictorConfig = Field(default_factory=MotionPredictorConfig)   
     
 
 class OCSORTTracker:
@@ -37,6 +37,12 @@ class OCSORTTracker:
         self.tracks : list[Track] = []
         self.frame_number = 0
         self.id_counter = 1
+        self.motion_engine : MotionPredictorEngine | None = None
+        if self.config.motion.enabled:
+            try:
+                self.motion_engine = MotionPredictorEngine(self.config.motion)
+            except FileNotFoundError as err:
+                print(f'[OCSORTTracker] {err}; using heuristic motion prediction.')
         if self.config.log_path:
             self.logger = logging.getLogger(f"{self.__class__.__name__}-{id(self)}")
             self.logger.setLevel(logging.INFO)
@@ -117,6 +123,8 @@ class OCSORTTracker:
 
     def init_track(self, bbox, score):
         track_config = {**self.config.model_dump()}
+        track_config['use_kalman'] = self.config.motion.use_kalman
+        track_config['kalman_fusion_blend'] = self.config.motion.kalman_fusion_blend
         if self.frame_number == 1:
             self.tracks.append(Track(bbox, score, self.id_counter, self.frame_number, track_config, StateTracking))
         else:
@@ -125,26 +133,33 @@ class OCSORTTracker:
 
     def predict_tracks(self):
         self.frame_number += 1
-        frame_counts = [-1]
         for track in self.get_tracks([StateTracking, StateLost, StateUnconfirmed]):
             track.predict()
-            frame_counts.append(min(self.config.update_window_end, track.frame_count))
-        max_len = max(frame_counts)
 
-        tracks = []
+        tracks_batch = []
         srcs = []
-        frame_counts = []
+        valid_lens = []
+        max_len = 0
         for track in self.get_tracks([StateTracking, StateLost, StateUnconfirmed]):
             k_last_updates = track.k_last_updates
             if len(k_last_updates) == 1:
-                track.history.predict[track.current_frame] = k_last_updates[0]
+                it0 = k_last_updates[0]
+                track.set_prediction_from_motion(
+                    it0.bbox,
+                    float(it0.score),
+                    var_q=None,
+                    var_r=None,
+                )
             elif len(k_last_updates) < self.config.update_window_start:
                 diffs = []
                 for i in range(1, len(k_last_updates)):
                     diffs.append(k_last_updates[i].bbox - k_last_updates[i - 1].bbox)
-                track.history.predict[track.current_frame] = TrackHistoryItem(
-                    np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox, 
-                    track.score
+                mean_bbox = np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox
+                track.set_prediction_from_motion(
+                    mean_bbox,
+                    track.score,
+                    var_q=None,
+                    var_r=None,
                 )
             else:
                 boxes = np.array([k_last_update.bbox for k_last_update in k_last_updates])
@@ -153,28 +168,57 @@ class OCSORTTracker:
                 boxes[:, 1] /= self.config.image_height
                 boxes[:, 2] /= self.config.image_width
                 boxes[:, 3] /= self.config.image_height
-                src = np.zeros(shape=(max_len, 13))
-                src[:len(boxes), :12] = compute_motion_features(boxes)
-                src[:len(boxes), 12] = scores
-                tracks.append(track)
-                srcs.append(src)
-                frame_counts.append(min(self.config.update_window_end, track.frame_count))
-        if len(tracks) > 0:
-            srcs = np.array(srcs)
-            srcs = torch.tensor(srcs, dtype=torch.float32).to(DEVICE).reshape(srcs.shape[0], srcs.shape[1], -1)
-            o = MODEL.inference(srcs, frame_counts)
-            preds = np.zeros(shape=(len(tracks), 5))
-            for i, track in enumerate(tracks):
-                preds[i] = o[i, frame_counts[i] - 1].cpu().numpy()
-            preds[:, 0] *= self.config.image_width 
-            preds[:, 1] *= self.config.image_height
-            preds[:, 2] *= self.config.image_width
-            preds[:, 3] *= self.config.image_height
-            for i, track in enumerate(tracks):
-                track.history.predict[track.current_frame] = TrackHistoryItem(
-                    BBOX(preds[i][:4]),
-                    float(preds[i][4].item())
+                L = len(boxes)
+                max_len = max(max_len, L)
+                tracks_batch.append(track)
+                srcs.append(
+                    (compute_motion_features(boxes), scores, L)
                 )
+                valid_lens.append(L)
+
+        if len(tracks_batch) > 0:
+            batched = np.zeros(shape=(len(tracks_batch), max_len, 13), dtype=np.float32)
+            for i, (motion12, scores, L) in enumerate(srcs):
+                batched[i, :L, :12] = motion12
+                batched[i, :L, 12] = scores
+
+            if self.motion_engine is not None:
+                preds_t, var_q_t, var_r_t = self.motion_engine.predict_batch(
+                    batched, valid_lens
+                )
+                preds = preds_t.cpu().numpy()
+                preds[:, 0] *= self.config.image_width
+                preds[:, 1] *= self.config.image_height
+                preds[:, 2] *= self.config.image_width
+                preds[:, 3] *= self.config.image_height
+                var_q_np = (
+                    var_q_t.cpu().numpy() if var_q_t is not None else None
+                )
+                var_r_np = (
+                    var_r_t.cpu().numpy() if var_r_t is not None else None
+                )
+                for i, track in enumerate(tracks_batch):
+                    vq = None if var_q_np is None else var_q_np[i]
+                    vr = None if var_r_np is None else var_r_np[i]
+                    track.set_prediction_from_motion(
+                        preds[i][:4],
+                        float(preds[i][4].item()),
+                        var_q=vq,
+                        var_r=vr,
+                    )
+            else:
+                for i, track in enumerate(tracks_batch):
+                    k_last_updates = track.k_last_updates
+                    diffs = []
+                    for j in range(1, len(k_last_updates)):
+                        diffs.append(k_last_updates[j].bbox - k_last_updates[j - 1].bbox)
+                    mean_bbox = np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox
+                    track.set_prediction_from_motion(
+                        mean_bbox,
+                        track.score,
+                        var_q=None,
+                        var_r=None,
+                    )
         for track in self.tracks:
             if track.state != StateDeleted and not track.is_valid:
                 track.last_state = track.state

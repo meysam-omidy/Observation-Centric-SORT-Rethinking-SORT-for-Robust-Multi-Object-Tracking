@@ -97,15 +97,12 @@ def batch_iou(bb1, bb2):
     return(o) 
 
 def batch_speed_direction(bb1, bb2):
-    print(bb1)
-    print(bb2)
     bb1 = np.expand_dims(bb1, 1)
     bb2 = np.expand_dims(bb2, 0)
     cx1 = (bb1[..., 0] + bb1[..., 2]) / 2
     cy1 = (bb1[..., 1] + bb1[..., 3]) / 2
     cx2 = (bb2[..., 0] + bb2[..., 2]) / 2
     cy2 = (bb2[..., 1] + bb2[..., 3]) / 2
-    print(cx1, cy1, cx2, cy2)
     dx = cx2 - cx1
     dy = cy2 - cy1
     return np.arctan2(dy, dx)
@@ -160,3 +157,46 @@ def compute_motion_features(bboxes):
         # First two frames acceleration = 0 (need at least 3 frames)
         
     return enhanced
+
+
+def tlbr_to_z(tlbr: Union[list, np.ndarray]) -> np.ndarray:
+    """Measurement (4,1): center x, y, area s, aspect ratio r = w/h. Input: xyxy top-left bottom-right."""
+    bbox = BBOX.from_tlbr(np.asarray(tlbr, dtype=float).reshape(4))
+    x, y, w, h = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    s = w * h
+    r = w / (h + 1e-6)
+    return np.array([[x], [y], [s], [r]])
+
+
+def z_to_tlbr(z: np.ndarray) -> np.ndarray:
+    """Convert SORT measurement z (4,1) or (4,) to tlbr xyxy in pixels."""
+    z = np.asarray(z, dtype=float).reshape(-1)
+    x, y, s, r = z[0], z[1], max(z[2], 0.0), max(z[3], 1e-6)
+    w = np.sqrt(s * r)
+    h = np.sqrt(s / r)
+    return np.array([x - w / 2, y - h / 2, x + w / 2, y + h / 2])
+
+
+def bbox_xywh_to_z(bbox_xywh: Union[list, np.ndarray]) -> np.ndarray:
+    """Column (4,1) z from center-xy wh box (pixels)."""
+    x, y, w, h = np.asarray(bbox_xywh, dtype=float).reshape(4)
+    s = w * h
+    r = w / (h + 1e-6)
+    return np.array([[x], [y], [s], [r]])
+
+
+def z_to_bbox_xywh(z: np.ndarray) -> BBOX:
+    """BBOX xywh from measurement z."""
+    z = np.asarray(z, dtype=float).reshape(-1)
+    x, y, s, r = z[0], z[1], max(z[2], 0.0), max(z[3], 1e-6)
+    w = np.sqrt(s * r)
+    h = np.sqrt(s / r)
+    return BBOX(np.array([x, y, w, h]))
+
+
+def get_p_matrix(c: float) -> np.ndarray:
+    return np.eye(7)
+
+
+def get_r_matrix(c: float) -> np.ndarray:
+    return np.eye(4)

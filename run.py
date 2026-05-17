@@ -7,17 +7,19 @@ import os
 import concurrent.futures
 
 # DATASET = 'MOT20'
-# DATASET = 'MOT17'
-DATASET = 'DanceTrack'
+DATASET = 'MOT17'
+# DATASET = 'DanceTrack'
 SPLIT = 'val'
 # SEQS = seqs = ['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-05-FRCNN', 'MOT17-09-FRCNN', 'MOT17-10-FRCNN', 'MOT17-11-FRCNN', 'MOT17-13-FRCNN', ]
-SEQS = None
-# SEQS = ['MOT17-02-FRCNN']
+# SEQS = None
+SEQS = ['MOT17-04-FRCNN']
 # SEQS = ['MOT20-01']
 # SEQS = ['dancetrack0079']
 # DETECTION_FOLDER = 'ocsort_x_mot20'
-# DETECTION_FOLDER = 'bytetrack_x_mot17'
-DETECTION_FOLDER = 'ocsort_x_dance'
+DETECTION_FOLDER = 'bytetrack_x_mot17'
+# DETECTION_FOLDER = 'ocsort_x_dance'
+DATASETS_DIR = 'D://Projects/.Datasets/'
+# DATASETS_DIR = '../../../.Datasets'
 
 @count_time
 def run(seq):
@@ -26,21 +28,26 @@ def run(seq):
     file = open(f'outputs/ocsort-self/{seq}.txt', 'w')
     detections = np.loadtxt(f'detections/{DETECTION_FOLDER}/{seq}.txt', delimiter=',')
     config = configparser.ConfigParser()
-    config.read(f'../../.Datasets/{DATASET}/{SPLIT}/{seq}/seqinfo.ini')
+    config.read(f'{DATASETS_DIR}/{DATASET}/{SPLIT}/{seq}/seqinfo.ini')
     tracker = OCSORTTracker({
-        # 'high_score_det_threshold': 0.5,
         'image_width': config['Sequence']['imWidth'],
         'image_height': config['Sequence']['imHeight'],
-        # 'update_window_start': 30,
         'association_speed_direction_coefficient': 0,
         'use_byte': True,
         'reupdate_type': 'constant',
-        'reupdate_constant_weight': '0.8'
-        # 'log_path': 'file.log',
-        # 'association_speed_direction_coefficient': 1
+        'reupdate_constant_weight': '0.8',
+        'motion': {
+            'enabled': True,
+            'model_type': 'transformer_learned',
+            'weights_path': 'motion_model_weights/transformer_learned_qr.pth',
+            'use_kalman': True,
+            'kalman_fusion_blend': 0.5,
+            # 'model_type': 'lstm_learned',
+            # 'weights_path': 'motion_model_weights/phase2_lstm_learned.pth',
+        },
     })
     for frame_number in range(1, int(config['Sequence']['seqLength']) + 1):
-        # print(frame_number)
+        print(frame_number)
         dets = detections[detections[:, 0] == frame_number][:, 1:]
         tracker.update(dets)
         for output in tracker.get_outputs():
@@ -52,7 +59,7 @@ if __name__ == '__main__':
     if SEQS:
         seqs = SEQS
     else:
-        seqs = os.listdir(f'../../.Datasets/{DATASET}/{SPLIT}/')
+        seqs = os.listdir(f'{DATASETS_DIR}/{DATASET}/{SPLIT}/')
     seqmap = open(f'./trackeval/seqmap/{DATASET.lower()}/custom.txt', 'w')
     seqmap.write('name\n')
     for seq in seqs:
