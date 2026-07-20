@@ -21,12 +21,16 @@ class TrackConfig(BaseModel):
 
 class TrackHistoryItem:
     def __init__(self, bbox : BBOX, score: float, type : str = None,
-                 var_q: np.ndarray = None, var_r: np.ndarray = None):
+                 var_q: np.ndarray = None, var_r: np.ndarray = None,
+                 observed: bool = True):
         self.bbox = bbox
         self.score = float(score)
         self.type = type
         self.var_q = None if var_q is None else np.asarray(var_q, dtype=float)
         self.var_r = None if var_r is None else np.asarray(var_r, dtype=float)
+        # True detection this frame vs. a predicted/interpolated fill-in — feeds the
+        # adaptive Kalman motion model's frames_since_obs/is_observed features.
+        self.observed = observed
 
     def __repr__(self):
         if self.type is not None:
@@ -213,6 +217,7 @@ class Track:
                 float(score),
                 var_q=var_q,
                 var_r=var_r,
+                observed=False,
             )
             return
         Q = None
@@ -233,6 +238,7 @@ class Track:
             float(score),
             var_q=var_q,
             var_r=var_r,
+            observed=False,
         )
         
     def predict(self):
@@ -294,7 +300,9 @@ class Track:
                 new_frame_index - last_frame_index + 1
             )
         for i in range(new_frame_index - last_frame_index + 1):
-            self.history.update[last_frame_index + i] = TrackHistoryItem(boxes[i], scores[i], 'virtual')
+            self.history.update[last_frame_index + i] = TrackHistoryItem(
+                boxes[i], scores[i], 'virtual', observed=False
+            )
 
 
 

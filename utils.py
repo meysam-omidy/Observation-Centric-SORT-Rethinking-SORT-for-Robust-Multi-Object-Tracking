@@ -143,20 +143,54 @@ def compute_motion_features(bboxes):
     n = len(bboxes)
     enhanced = np.zeros((n, 12))
     enhanced[:, :4] = bboxes
-    
+
     # Velocity (first-order difference)
     if n > 1:
         velocity = np.diff(bboxes, axis=0)
         enhanced[1:, 4:8] = velocity
         # First frame velocity = 0 (no previous frame)
-        
+
     # Acceleration (second-order difference)
     if n > 2:
         acceleration = np.diff(velocity, axis=0)
         enhanced[2:, 8:12] = acceleration
         # First two frames acceleration = 0 (need at least 3 frames)
-        
+
     return enhanced
+
+
+# adaptive Kalman feature layout (see motion-predictor/adaptive_kalman_dataset.py)
+ADAPTIVE_KALMAN_FEATURE_DIM = 15
+ADAPTIVE_KALMAN_SCORE_IDX = 12
+ADAPTIVE_KALMAN_FRAMES_SINCE_IDX = 13
+ADAPTIVE_KALMAN_OBSERVED_IDX = 14
+
+
+def compute_adaptive_kalman_features(bboxes, scores, observed, max_gap_norm=30.0):
+    """
+    Per-track feature window for the adaptive Kalman Q/R model (15-D):
+    [x, y, w, h, vx..vh, ax..ah, det_score, frames_since_obs, is_observed].
+
+    Non-observed (gap) frames are zeroed out (position/velocity/acceleration/score),
+    mirroring the random_drop_prob augmentation the model was trained with.
+    """
+    observed = np.asarray(observed, dtype=bool)
+    n = len(bboxes)
+    feat = np.zeros((n, ADAPTIVE_KALMAN_FEATURE_DIM), dtype=np.float32)
+    feat[:, :12] = compute_motion_features(bboxes)
+    feat[:, ADAPTIVE_KALMAN_SCORE_IDX] = scores
+    feat[~observed, :12] = 0.0
+    feat[~observed, ADAPTIVE_KALMAN_SCORE_IDX] = 0.0
+
+    gap = 0.0
+    for i in range(n):
+        if observed[i]:
+            gap = 0.0
+        else:
+            gap += 1.0
+        feat[i, ADAPTIVE_KALMAN_FRAMES_SINCE_IDX] = min(gap / max_gap_norm, 1.0)
+        feat[i, ADAPTIVE_KALMAN_OBSERVED_IDX] = 1.0 if observed[i] else 0.0
+    return feat
 
 
 def tlbr_to_z(tlbr: Union[list, np.ndarray]) -> np.ndarray:

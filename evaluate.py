@@ -6,10 +6,11 @@ import os
 DATASETS_DIR = 'D://Projects/.Datasets/'
 
 @count_time
-def evaluate(dataset, split):
-    # trackers_to_eval = ['ocsort-self', 'oc-sort']
-    trackers_to_eval = ['ocsort-self', 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt']
-    # trackers_to_eval = 'cbiou'
+def evaluate(dataset, split, trackers_to_eval=None, datasets_dir=None):
+    if trackers_to_eval is None:
+        trackers_to_eval = ['ocsort-self', 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt']
+    if datasets_dir is None:
+        datasets_dir = DATASETS_DIR
 
     eval_config = {'USE_PARALLEL': True,
                     'NUM_PARALLEL_CORES': 8,
@@ -28,7 +29,7 @@ def evaluate(dataset, split):
                     'OUTPUT_DETAILED': False,
                     'PLOT_CURVES': False}
 
-    dataset_config = {'GT_FOLDER': f'{DATASETS_DIR}/{dataset}/{split}/',
+    dataset_config = {'GT_FOLDER': f'{datasets_dir}/{dataset}/{split}/',
                         'TRACKERS_FOLDER': 'outputs',
                         'OUTPUT_FOLDER': None,
                         'TRACKERS_TO_EVAL': trackers_to_eval,

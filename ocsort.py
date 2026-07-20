@@ -1,6 +1,9 @@
 from track import Track
 from track_state import TrackState, StateUnconfirmed, StateTracking, StateLost, StateDeleted
-from utils import select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features, get_dict_item, BBOX
+from utils import (
+    select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features,
+    compute_adaptive_kalman_features, get_dict_item, BBOX,
+)
 from pydantic import BaseModel, Field
 from motion_predictor import MotionPredictorConfig, MotionPredictorEngine
 from typing import Literal
@@ -131,12 +134,26 @@ class OCSORTTracker:
             self.tracks.append(Track(bbox, score, self.id_counter, self.frame_number, track_config, StateUnconfirmed))
         self.id_counter += 1
 
+    @staticmethod
+    def _cv_bbox(k_last_updates) -> np.ndarray:
+        """Constant-velocity extrapolation: mean frame-to-frame diff + last bbox."""
+        diffs = [
+            k_last_updates[i].bbox - k_last_updates[i - 1].bbox
+            for i in range(1, len(k_last_updates))
+        ]
+        return np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox
+
     def predict_tracks(self):
         self.frame_number += 1
         for track in self.get_tracks([StateTracking, StateLost, StateUnconfirmed]):
             track.predict()
 
+        use_adaptive = (
+            self.motion_engine is not None and self.motion_engine.cfg.model_type == 'adaptive_kalman'
+        )
+
         tracks_batch = []
+        cv_bboxes = []
         srcs = []
         valid_lens = []
         max_len = 0
@@ -151,12 +168,8 @@ class OCSORTTracker:
                     var_r=None,
                 )
             elif len(k_last_updates) < self.config.update_window_start:
-                diffs = []
-                for i in range(1, len(k_last_updates)):
-                    diffs.append(k_last_updates[i].bbox - k_last_updates[i - 1].bbox)
-                mean_bbox = np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox
                 track.set_prediction_from_motion(
-                    mean_bbox,
+                    self._cv_bbox(k_last_updates),
                     track.score,
                     var_q=None,
                     var_r=None,
@@ -171,54 +184,54 @@ class OCSORTTracker:
                 L = len(boxes)
                 max_len = max(max_len, L)
                 tracks_batch.append(track)
-                srcs.append(
-                    (compute_motion_features(boxes), scores, L)
-                )
+                cv_bboxes.append(self._cv_bbox(k_last_updates))
+                if use_adaptive:
+                    observed = np.array([k_last_update.observed for k_last_update in k_last_updates])
+                    srcs.append(
+                        compute_adaptive_kalman_features(
+                            boxes, scores, observed, self.motion_engine.max_gap_norm
+                        )
+                    )
+                else:
+                    srcs.append((compute_motion_features(boxes), scores))
                 valid_lens.append(L)
 
         if len(tracks_batch) > 0:
-            batched = np.zeros(shape=(len(tracks_batch), max_len, 13), dtype=np.float32)
-            for i, (motion12, scores, L) in enumerate(srcs):
-                batched[i, :L, :12] = motion12
-                batched[i, :L, 12] = scores
+            feature_dim = 15 if use_adaptive else 13
+            batched = np.zeros(shape=(len(tracks_batch), max_len, feature_dim), dtype=np.float32)
+            for i, L in enumerate(valid_lens):
+                if use_adaptive:
+                    # Left-pad (right-align): the model reads its "current step" off
+                    # the last row, so the real data must sit at the tail.
+                    batched[i, max_len - L:, :] = srcs[i]
+                else:
+                    motion12, scores = srcs[i]
+                    batched[i, :L, :12] = motion12
+                    batched[i, :L, 12] = scores
 
-            if self.motion_engine is not None:
-                preds_t, var_q_t, var_r_t = self.motion_engine.predict_batch(
-                    batched, valid_lens
-                )
+            preds_t, var_q_t, var_r_t = (
+                self.motion_engine.predict_batch(batched, valid_lens)
+                if self.motion_engine is not None
+                else (None, None, None)
+            )
+            preds = None
+            if preds_t is not None:
                 preds = preds_t.cpu().numpy()
                 preds[:, 0] *= self.config.image_width
                 preds[:, 1] *= self.config.image_height
                 preds[:, 2] *= self.config.image_width
                 preds[:, 3] *= self.config.image_height
-                var_q_np = (
-                    var_q_t.cpu().numpy() if var_q_t is not None else None
-                )
-                var_r_np = (
-                    var_r_t.cpu().numpy() if var_r_t is not None else None
-                )
-                for i, track in enumerate(tracks_batch):
-                    vq = None if var_q_np is None else var_q_np[i]
-                    vr = None if var_r_np is None else var_r_np[i]
-                    track.set_prediction_from_motion(
-                        preds[i][:4],
-                        float(preds[i][4].item()),
-                        var_q=vq,
-                        var_r=vr,
-                    )
-            else:
-                for i, track in enumerate(tracks_batch):
-                    k_last_updates = track.k_last_updates
-                    diffs = []
-                    for j in range(1, len(k_last_updates)):
-                        diffs.append(k_last_updates[j].bbox - k_last_updates[j - 1].bbox)
-                    mean_bbox = np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox
-                    track.set_prediction_from_motion(
-                        mean_bbox,
-                        track.score,
-                        var_q=None,
-                        var_r=None,
-                    )
+            var_q_np = var_q_t.cpu().numpy() if var_q_t is not None else None
+            var_r_np = var_r_t.cpu().numpy() if var_r_t is not None else None
+
+            for i, track in enumerate(tracks_batch):
+                vq = None if var_q_np is None else var_q_np[i]
+                vr = None if var_r_np is None else var_r_np[i]
+                if preds is not None:
+                    xywh, score = preds[i][:4], float(preds[i][4].item())
+                else:
+                    xywh, score = cv_bboxes[i], track.score
+                track.set_prediction_from_motion(xywh, score, var_q=vq, var_r=vr)
         for track in self.tracks:
             if track.state != StateDeleted and not track.is_valid:
                 track.last_state = track.state
