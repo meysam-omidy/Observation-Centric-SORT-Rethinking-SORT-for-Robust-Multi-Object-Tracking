@@ -14,12 +14,18 @@ from utils import (
 )
 
 
-def create_sort_kalman(tlbr: np.ndarray, score: float) -> FilterPyKalman:
+def create_sort_kalman(tlbr: np.ndarray, score: float, use_oru: bool = False) -> FilterPyKalman:
     """
-    Standard linear KF for SORT (7-D state: x, y, s, r, vx, vy, vs) with plain filterpy
-    predict/update (no custom freeze / gap logic).
+    Standard linear KF for SORT (7-D state: x, y, s, r, vx, vy, vs).
+
+    use_oru=False: plain filterpy predict/update (no gap logic).
+    use_oru=True:  OC-SORT Observation-Centric Re-Update — on re-detection after a
+                   gap, freeze()/re_update() rewinds to the last real observation and
+                   replays the filter through a virtual straight-line trajectory to the
+                   new observation, correcting the drifted velocity. Same matrices and
+                   confidence-scaled R; only the predict/update mechanics differ.
     """
-    kf = FilterPyKalman(7, 4)
+    kf = KalmanFilter(7, 4) if use_oru else FilterPyKalman(7, 4)
     kf.F = np.array(
         [
             [1, 0, 0, 0, 1, 0, 0],
@@ -58,6 +64,9 @@ def create_sort_kalman(tlbr: np.ndarray, score: float) -> FilterPyKalman:
     kf.Q[4:, 4:] *= 0.01
     z = tlbr_to_z(tlbr)
     kf.x[:4] = z
+    if use_oru:
+        # seed the observation history so the first re_update has a valid anchor
+        kf.history['update'][kf.age] = z
     return kf
 
 

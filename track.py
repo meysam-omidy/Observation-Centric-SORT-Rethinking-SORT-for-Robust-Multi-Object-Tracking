@@ -17,6 +17,7 @@ class TrackConfig(BaseModel):
     reupdate_constant_weight : float = 1
     use_kalman : bool = True
     kalman_fusion_blend : float = 1.0
+    use_oru : bool = False
 
 
 class TrackHistoryItem:
@@ -90,7 +91,7 @@ class Track:
         }
         self.id = id
         if self.config.use_kalman:
-            self.kf = create_sort_kalman(np.asarray(bbox, dtype=float), float(score))
+            self.kf = create_sort_kalman(np.asarray(bbox, dtype=float), float(score), use_oru=self.config.use_oru)
         else:
             self.kf = None
 

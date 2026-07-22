@@ -3,7 +3,7 @@ from utils import count_time
 import numpy as np
 import os
 
-DATASETS_DIR = 'D://Projects/.Datasets/'
+DATASETS_DIR = 'C:/Projects/.Datasets/'
 
 @count_time
 def evaluate(dataset, split, trackers_to_eval=None, datasets_dir=None):

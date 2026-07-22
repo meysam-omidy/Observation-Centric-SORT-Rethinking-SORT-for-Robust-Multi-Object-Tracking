@@ -49,6 +49,7 @@ def tracker_config(args, image_width: str, image_height: str) -> dict:
         'association_iou_coefficient': args.association_iou_coefficient,
         'association_speed_direction_coefficient': args.association_speed_direction_coefficient,
         'use_byte': args.use_byte,
+        'use_oru': args.use_oru,
         'reupdate_type': args.reupdate_type,
         'reupdate_constant_weight': args.reupdate_constant_weight,
         'motion': {
@@ -66,7 +67,7 @@ def tracker_config(args, image_width: str, image_height: str) -> dict:
 @count_time
 def run(seq: str, args) -> None:
     print(seq)
-    detections = np.loadtxt(f'detections/{args.detection_folder}/{seq}.txt', delimiter=',')
+    detections = np.loadtxt(f'{args.detections_dir}/{args.dataset}/{seq}.txt', delimiter=',')
     config = configparser.ConfigParser()
     config.read(f'{args.datasets_dir}/{args.dataset}/{args.split}/{seq}/seqinfo.ini')
     tracker = OCSORTTracker(tracker_config(
@@ -111,13 +112,13 @@ if __name__ == '__main__':
     p.add_argument('--dataset', type=str, default='MOT17', choices=['MOT17', 'MOT20', 'DanceTrack'])
     p.add_argument('--split', type=str, default='val')
     p.add_argument('--seqs', type=str, nargs='*', default=None, help='specific sequence names; default = whole split')
-    p.add_argument('--detection_folder', type=str, default='bytetrack_x_mot17')
     p.add_argument('--datasets_dir', type=str, default='C:/Projects/.Datasets')
+    p.add_argument('--detections_dir', type=str, default='C:/Projects/.Detections')
     p.add_argument('--tracker_name', type=str, default='ocsort-self', help='output subfolder under outputs/')
     p.add_argument('--evaluate', action='store_true', help='run trackeval (HOTA/CLEAR/Identity) after tracking')
 
     p.add_argument('--max_age', type=int, default=30)
-    p.add_argument('--update_window_start', type=int, default=20)
+    p.add_argument('--update_window_start', type=int, default=30)
     p.add_argument('--update_window_end', type=int, default=50)
     p.add_argument('--min_box_area', type=int, default=100)
     p.add_argument('--max_aspect_ratio', type=float, default=1.6)
@@ -129,9 +130,11 @@ if __name__ == '__main__':
     p.add_argument('--match_low_score_dets_with_confirmed_trks_threshold', type=float, default=0.5)
     p.add_argument('--match_remained_high_score_dets_with_unconfirmed_trks_threshold', type=float, default=0.3)
     p.add_argument('--association_iou_coefficient', type=float, default=1.0)
-    p.add_argument('--association_speed_direction_coefficient', type=float, default=0.0)
+    p.add_argument('--association_speed_direction_coefficient', type=float, default=0.3)
     p.add_argument('--use_byte', action='store_true', default=True)
     p.add_argument('--no_use_byte', action='store_false', dest='use_byte')
+    p.add_argument('--use_oru', action='store_true', default=False,
+                   help='OC-SORT Observation-Centric Re-Update: replay virtual observations through the KF on re-detection after a gap')
     p.add_argument('--reupdate_type', type=str, default='constant', choices=['constant', 'relative', 'none'])
     p.add_argument('--reupdate_constant_weight', type=float, default=0.8)
 
@@ -143,7 +146,7 @@ if __name__ == '__main__':
     )
     p.add_argument(
         '--weights_path', type=str,
-        default='../motion-predictor/checkpoints/adaptive_kalman_3/best_model.pth',
+        default='../motion-predictor/checkpoints/adaptive_kalman_2/best_model.pth',
     )
     p.add_argument('--device', type=str, default=None, help='cuda | cpu | mps; default = auto')
     p.add_argument('--use_kalman', action='store_true', default=True)
