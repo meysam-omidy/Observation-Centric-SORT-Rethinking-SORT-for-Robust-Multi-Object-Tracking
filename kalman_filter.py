@@ -14,7 +14,8 @@ from utils import (
 )
 
 
-def create_sort_kalman(tlbr: np.ndarray, score: float, use_oru: bool = False) -> FilterPyKalman:
+def create_sort_kalman(tlbr: np.ndarray, score: float, use_oru: bool = False,
+                       use_confidence_r: bool = False) -> FilterPyKalman:
     """
     Standard linear KF for SORT (7-D state: x, y, s, r, vx, vy, vs).
 
@@ -24,6 +25,11 @@ def create_sort_kalman(tlbr: np.ndarray, score: float, use_oru: bool = False) ->
                    replays the filter through a virtual straight-line trajectory to the
                    new observation, correcting the drifted velocity. Same matrices and
                    confidence-scaled R; only the predict/update mechanics differ.
+
+    use_confidence_r=False: classic SORT R (huge 2e7 area variance = ignore measured scale).
+    use_confidence_r=True:  wbrt-style simple diagonal R = diag([1,1,10,10])·e^(2(1-conf)),
+                   which TRUSTS measured scale (area var 10). Confirmed to recover ~0.05 AssA
+                   on DanceTrack vs the 2e7 form. Track.update recomputes the same R per frame.
     """
     kf = KalmanFilter(7, 4) if use_oru else FilterPyKalman(7, 4)
     kf.F = np.array(
@@ -47,15 +53,18 @@ def create_sort_kalman(tlbr: np.ndarray, score: float, use_oru: bool = False) ->
         ],
         dtype=float,
     )
-    kf.R = np.array(
-        [
-            [20, 0, -350, 0],
-            [0, 20, 700, 0],
-            [-350, 700, 2e7, 50],
-            [0, 0, 50, 0],
-        ],
-        dtype=float,
-    )
+    if use_confidence_r:
+        kf.R = np.eye(4)
+    else:
+        kf.R = np.array(
+            [
+                [20, 0, -350, 0],
+                [0, 20, 700, 0],
+                [-350, 700, 2e7, 50],
+                [0, 0, 50, 0],
+            ],
+            dtype=float,
+        )
     kf.R[2:, 2:] *= 10
     kf.R *= np.e ** (2 * (1 - float(score)))
     kf.P[4:, 4:] *= 1000

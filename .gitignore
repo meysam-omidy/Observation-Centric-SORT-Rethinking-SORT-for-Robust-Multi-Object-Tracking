@@ -211,6 +211,7 @@ results
 ablations
 ablation_results
 trackeval
+analysis
 data*
 *.ipynb
 *.pth

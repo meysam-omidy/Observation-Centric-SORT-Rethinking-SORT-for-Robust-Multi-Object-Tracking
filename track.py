@@ -18,6 +18,7 @@ class TrackConfig(BaseModel):
     use_kalman : bool = True
     kalman_fusion_blend : float = 1.0
     use_oru : bool = False
+    use_confidence_r : bool = False
 
 
 class TrackHistoryItem:
@@ -91,7 +92,9 @@ class Track:
         }
         self.id = id
         if self.config.use_kalman:
-            self.kf = create_sort_kalman(np.asarray(bbox, dtype=float), float(score), use_oru=self.config.use_oru)
+            self.kf = create_sort_kalman(np.asarray(bbox, dtype=float), float(score),
+                                         use_oru=self.config.use_oru,
+                                         use_confidence_r=self.config.use_confidence_r)
         else:
             self.kf = None
 
@@ -261,19 +264,26 @@ class Track:
         )
         if self.kf is not None:
             z = tlbr_to_z(bbox)
-            pred_item = self.history.predict.get(self.current_frame)
-            var_r = pred_item.var_r if pred_item is not None else None
-            if var_r is not None:
-                xywh_obs = BBOX.from_tlbr(bbox)
-                R = learned_measurement_noise_matrix(
-                    var_r,
-                    xywh_obs,
-                    self.config.image_width,
-                    self.config.image_height,
-                )
+            if self.config.use_confidence_r:
+                # wbrt-style per-frame confidence R: overrides learned/fixed R.
+                R = np.eye(4)
+                R[2:, 2:] *= 10
+                R *= np.e ** (2 * (1 - float(score)))
                 self.kf.update(z, R=R)
             else:
-                self.kf.update(z)
+                pred_item = self.history.predict.get(self.current_frame)
+                var_r = pred_item.var_r if pred_item is not None else None
+                if var_r is not None:
+                    xywh_obs = BBOX.from_tlbr(bbox)
+                    R = learned_measurement_noise_matrix(
+                        var_r,
+                        xywh_obs,
+                        self.config.image_width,
+                        self.config.image_height,
+                    )
+                    self.kf.update(z, R=R)
+                else:
+                    self.kf.update(z)
         self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
         self.age = 0
         if self.state == StateUnconfirmed:

@@ -29,6 +29,7 @@ class OCSORTTrackerConfig(BaseModel):
     image_height : int = 1080
     use_byte : bool = False
     use_oru : bool = False
+    use_confidence_r : bool = False
     log_path : str = None
     reupdate_type : Literal['constant', 'relative', None] = None
     reupdate_constant_weight : float = 1

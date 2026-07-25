@@ -50,6 +50,7 @@ def tracker_config(args, image_width: str, image_height: str) -> dict:
         'association_speed_direction_coefficient': args.association_speed_direction_coefficient,
         'use_byte': args.use_byte,
         'use_oru': args.use_oru,
+        'use_confidence_r': args.use_confidence_r,
         'reupdate_type': args.reupdate_type,
         'reupdate_constant_weight': args.reupdate_constant_weight,
         'motion': {
@@ -135,6 +136,8 @@ if __name__ == '__main__':
     p.add_argument('--no_use_byte', action='store_false', dest='use_byte')
     p.add_argument('--use_oru', action='store_true', default=False,
                    help='OC-SORT Observation-Centric Re-Update: replay virtual observations through the KF on re-detection after a gap')
+    p.add_argument('--use_confidence_r', action='store_true', default=False,
+                   help='wbrt-style simple per-frame confidence R (diag[1,1,10,10]*e^(2(1-conf))); trusts measured scale, overrides learned var_r')
     p.add_argument('--reupdate_type', type=str, default='constant', choices=['constant', 'relative', 'none'])
     p.add_argument('--reupdate_constant_weight', type=float, default=0.8)
 
