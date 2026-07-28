@@ -307,7 +307,7 @@ if __name__ == "__main__":
     p.add_argument("--no_use_byte", action="store_false", dest="use_byte")
     p.add_argument("--use_oru", action="store_true", default=False)
     p.add_argument("--use_confidence_r", action="store_true", default=False)
-    p.add_argument("--reupdate_type", default="constant", choices=["constant", "relative", "none"])
+    p.add_argument("--reupdate_type", default="relative", choices=["constant", "relative", "none"])
     p.add_argument("--reupdate_weight", type=float, default=0.8)
     p.add_argument("--motion_enabled", action="store_true", default=True)
     p.add_argument("--no_motion", action="store_false", dest="motion_enabled")

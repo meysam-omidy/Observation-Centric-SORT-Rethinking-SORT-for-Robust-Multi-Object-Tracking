@@ -166,8 +166,12 @@ class Track:
 
     @property
     def score(self) -> float:
+        # Most recent detection's confidence (frame-ordered), not the running mean
+        # over the whole track — the mean muddied the reported score and the score
+        # fed to prediction. get_dict_item(-1) is the latest frame (reupdate keeps
+        # history.update frame-sorted).
         if len(self.history.update) > 0:
-            return np.mean([history_item.score for history_item in self.history.update.values()]).item()
+            return float(get_dict_item(self.history.update, -1).score)
         else:
             return 0
     
@@ -295,25 +299,35 @@ class Track:
             self.reupdate()
 
     def reupdate(self):
-        new_frame_index = get_dict_key(self.history.update, -1)
-        last_frame_index = get_dict_key(self.history.update, -2)
+        # Fill the frames between the last real observation (before the gap) and the
+        # current one with a virtual straight-line trajectory (OC-SORT ORU idea).
+        new_frame_index = get_dict_key(self.history.update, -1)   # = current frame
+        last_frame_index = get_dict_key(self.history.update, -2)  # last real update before gap
+        gap = new_frame_index - last_frame_index
         boxes = np.linspace(
-            get_dict_item(self.history.update, -2).bbox, 
-            get_dict_item(self.history.update, -1).bbox, 
-            new_frame_index - last_frame_index + 1
+            get_dict_item(self.history.update, -2).bbox,
+            get_dict_item(self.history.update, -1).bbox,
+            gap + 1,
         )
         if self.config.reupdate_type == 'constant':
             scores = [self.config.reupdate_constant_weight for _ in range(len(boxes))]
         else:
             scores = np.linspace(
-                get_dict_item(self.history.update, -2).score, 
-                get_dict_item(self.history.update, -1).score, 
-                new_frame_index - last_frame_index + 1
+                get_dict_item(self.history.update, -2).score,
+                get_dict_item(self.history.update, -1).score,
+                gap + 1,
             )
-        for i in range(new_frame_index - last_frame_index + 1):
+        # Only the INTERIOR gap frames become virtual fills; never overwrite the two
+        # real endpoints (that destroyed their observed=True flag and real detection
+        # score, which feed the motion model and the output).
+        for i in range(1, gap):
             self.history.update[last_frame_index + i] = TrackHistoryItem(
                 boxes[i], scores[i], 'virtual', observed=False
             )
+        # Restore frame order: the new interior keys are appended out of order, which
+        # would make get_dict_item(update, -1) return a gap frame instead of the
+        # current one (corrupting mot_format output, speed_direction, and score).
+        self.history.update = {k: self.history.update[k] for k in sorted(self.history.update)}
 
 
 
