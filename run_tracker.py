@@ -51,6 +51,7 @@ def tracker_config(args, image_width: str, image_height: str) -> dict:
         'use_byte': args.use_byte,
         'use_oru': args.use_oru,
         'use_confidence_r': args.use_confidence_r,
+        'use_learned_q': args.use_learned_q,
         'reupdate_type': args.reupdate_type,
         'reupdate_constant_weight': args.reupdate_constant_weight,
         'motion': {
@@ -102,7 +103,7 @@ def main(args) -> None:
         print('evaluating...')
         evaluate(
             args.dataset, args.split,
-            trackers_to_eval=[args.tracker_name],
+            trackers_to_eval=[args.tracker_name, 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt', 'dl-confr'],
             datasets_dir=args.datasets_dir,
         )
 
@@ -120,7 +121,7 @@ if __name__ == '__main__':
 
     p.add_argument('--max_age', type=int, default=30)
     p.add_argument('--update_window_start', type=int, default=30)
-    p.add_argument('--update_window_end', type=int, default=50)
+    p.add_argument('--update_window_end', type=int, default=90)
     p.add_argument('--min_box_area', type=int, default=100)
     p.add_argument('--max_aspect_ratio', type=float, default=1.6)
     p.add_argument('--delta_t', type=int, default=3)
@@ -134,10 +135,15 @@ if __name__ == '__main__':
     p.add_argument('--association_speed_direction_coefficient', type=float, default=0.3)
     p.add_argument('--use_byte', action='store_true', default=True)
     p.add_argument('--no_use_byte', action='store_false', dest='use_byte')
-    p.add_argument('--use_oru', action='store_true', default=False,
+    p.add_argument('--use_oru', action='store_true', default=True,
                    help='OC-SORT Observation-Centric Re-Update: replay virtual observations through the KF on re-detection after a gap')
+    p.add_argument('--no_use_oru', action='store_false', dest='use_oru')
     p.add_argument('--use_confidence_r', action='store_true', default=False,
                    help='wbrt-style simple per-frame confidence R (diag[1,1,10,10]*e^(2(1-conf))); trusts measured scale, overrides learned var_r')
+    p.add_argument('--use_learned_q', action='store_true', default=True,
+                   help="use the model's var_q for process noise Q")
+    p.add_argument('--no_use_learned_q', action='store_false', dest='use_learned_q',
+                   help="ignore the model's var_q; keep the KF's fixed Q (pairs well with learned R)")
     p.add_argument('--reupdate_type', type=str, default='constant', choices=['constant', 'relative', 'none'])
     p.add_argument('--reupdate_constant_weight', type=float, default=0.8)
 
@@ -149,7 +155,8 @@ if __name__ == '__main__':
     )
     p.add_argument(
         '--weights_path', type=str,
-        default='../motion-predictor/checkpoints/adaptive_kalman_2/best_model.pth',
+        default='../motion-predictor/checkpoints/adaptive_kalman_real_low_data/best_model.pth',
+        # default='../motion-predictor/checkpoints/adaptive_kalman_2/best_model.pth',
     )
     p.add_argument('--device', type=str, default=None, help='cuda | cpu | mps; default = auto')
     p.add_argument('--use_kalman', action='store_true', default=True)

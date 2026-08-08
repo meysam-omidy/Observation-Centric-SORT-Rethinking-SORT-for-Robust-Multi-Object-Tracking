@@ -30,6 +30,7 @@ class OCSORTTrackerConfig(BaseModel):
     use_byte : bool = False
     use_oru : bool = False
     use_confidence_r : bool = False
+    use_learned_q : bool = True   # False -> ignore the model's var_q, keep the KF's fixed Q
     log_path : str = None
     reupdate_type : Literal['constant', 'relative', None] = None
     reupdate_constant_weight : float = 1
@@ -89,7 +90,8 @@ class OCSORTTracker:
 
         if self.config.use_byte:
             remained_confirmed_tracks = select_indices(confirmed_tracks, unmatched_confirmed_track_indices)
-            remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state == StateTracking]
+            # remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking]]
+            remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking, StateLost]]
             matches, unmatched_remained_track_indices, unmatched_low_score_detection_indices = self.associate(
                 remained_tracking_tracks, 
                 low_confidence_detections, 
@@ -227,7 +229,7 @@ class OCSORTTracker:
             var_r_np = var_r_t.cpu().numpy() if var_r_t is not None else None
 
             for i, track in enumerate(tracks_batch):
-                vq = None if var_q_np is None else var_q_np[i]
+                vq = None if (var_q_np is None or not self.config.use_learned_q) else var_q_np[i]
                 vr = None if var_r_np is None else var_r_np[i]
                 if preds is not None:
                     xywh, score = preds[i][:4], float(preds[i][4].item())

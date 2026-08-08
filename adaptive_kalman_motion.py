@@ -37,6 +37,20 @@ def confidence_log_r_prior(
     s = score.clamp(0.0, 1.0)
     return base_log_var + alpha * (1.0 - s)
 
+def nfc(n_layers, input_dim, output_dim, dropout):
+    components = []
+    dims = torch.linspace(input_dim, output_dim, n_layers + 1)
+    dims = [int(x) for x in dims]
+    for i in range(len(dims) - 2):
+        components.extend([
+            nn.Linear(dims[i], dims[i+1]),
+            nn.LayerNorm(dims[i+1]),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+        ])
+    components.append(nn.Linear(dims[-2], dims[-1]))
+    return nn.Sequential(*components)
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -56,15 +70,36 @@ class PositionalEncoding(nn.Module):
 class _AdaptiveKalmanHead(nn.Module):
     """Shared Q/R output heads with confidence-R prior on R."""
 
-    def __init__(self, hidden_dim: int, conf_alpha: float = 2.0, q_init_bias: float = -12.0):
+    def __init__(self, hidden_dim: int, dropout: float, conf_alpha: float = 2.0, q_init_bias: float = -12.0):
         super().__init__()
         self.conf_alpha = conf_alpha
-        self.q_head = nn.Linear(hidden_dim, 4)
-        nn.init.constant_(self.q_head.bias, q_init_bias)
-        nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
-        self.r_residual_head = nn.Linear(hidden_dim, 4)
-        nn.init.zeros_(self.r_residual_head.weight)
-        nn.init.zeros_(self.r_residual_head.bias)
+        # Q head output is interpreted directly as log(var_q) by the loss.
+        # Bias = -12 → exp(-12) ≈ 6e-6 at init: a mid-scale start that sits
+        # between low-motion (MOT17 ~6e-7) and high-motion (DanceTrack ~6e-5)
+        # process noise, so the head does not have to travel far in either
+        # direction and low-motion data is not stuck high early in training.
+        
+        self.q_head = nfc(
+            n_layers=3,
+            input_dim=hidden_dim,
+            output_dim=4,
+            dropout=dropout * 0.5
+        )
+        self.r_residual_head = nfc(
+            n_layers=3,
+            input_dim=hidden_dim,
+            output_dim=4,
+            dropout=dropout * 0.5
+        )
+        # self.q_head = nn.Linear(hidden_dim, 4)
+        # nn.init.constant_(self.q_head.bias, q_init_bias)
+        # nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
+        # Additive log-space delta on the confidence prior. Zero init → start at
+        # prior; signed delta lets R go above or below the prior (unlike the old
+        # prior_var + exp(logit) floor which froze loss_r when prior was too high).
+        # self.r_residual_head = nn.Linear(hidden_dim, 4)
+        # nn.init.zeros_(self.r_residual_head.weight)
+        # nn.init.zeros_(self.r_residual_head.bias)
 
     def forward(
         self, hidden: torch.Tensor, scores: torch.Tensor
@@ -76,8 +111,12 @@ class _AdaptiveKalmanHead(nn.Module):
         return log_var_q, log_var_r
 
 
+
 class AdaptiveKalmanTransformer(nn.Module):
-    """Transformer encoder over [history | current step] -> log_var_q, log_var_r. No bbox output."""
+    """
+    Transformer encoder over [history | future-context] → per-step log_var_q, log_var_r.
+    No bbox output.
+    """
 
     def __init__(
         self,
@@ -94,16 +133,11 @@ class AdaptiveKalmanTransformer(nn.Module):
         self.d_model = d_model
         self.conf_alpha = conf_alpha
 
-        self.in_fc = nn.Sequential(
-            nn.Linear(input_dim, d_model // 4),
-            nn.LayerNorm(d_model // 4),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 4, d_model // 2),
-            nn.LayerNorm(d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(d_model // 2, d_model),
+        self.in_fc = nfc(
+            n_layers=3,
+            input_dim=input_dim,
+            output_dim=d_model,
+            dropout=dropout * 0.5
         )
         self.pos_enc = PositionalEncoding(d_model)
         self.transformer = nn.TransformerEncoder(
@@ -119,7 +153,7 @@ class AdaptiveKalmanTransformer(nn.Module):
             num_layers=num_layers,
             norm=nn.LayerNorm(d_model),
         )
-        self.head = _AdaptiveKalmanHead(d_model, conf_alpha=conf_alpha)
+        self.head = _AdaptiveKalmanHead(d_model, dropout, conf_alpha=conf_alpha)
 
     @staticmethod
     def _causal_mask(src_len: int, ctx_len: int, device: torch.device) -> torch.Tensor:

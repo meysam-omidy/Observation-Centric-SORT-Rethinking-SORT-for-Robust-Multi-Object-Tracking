@@ -171,16 +171,30 @@ def compute_adaptive_kalman_features(bboxes, scores, observed, max_gap_norm=30.0
     Per-track feature window for the adaptive Kalman Q/R model (15-D):
     [x, y, w, h, vx..vh, ax..ah, det_score, frames_since_obs, is_observed].
 
-    Non-observed (gap) frames are zeroed out (position/velocity/acceleration/score),
-    mirroring the random_drop_prob augmentation the model was trained with.
+    GAP-SAFE CONTRACT — must stay identical to the training builder
+    motion-predictor/adaptive_kalman_dataset.py::build_adaptive_kalman_features:
+      - position     kept only on observed rows (unobserved -> 0)
+      - velocity[i]     only when rows i and i-1 are both observed (else 0)
+      - acceleration[i] only when rows i, i-1, i-2 are all observed (else 0)
+    Any derivative that would cross a gap is zeroed, so the features depend ONLY on
+    real observations and never on whatever box fills a gap (KF prediction here at
+    inference, zero in training). This removes the recovery-frame velocity spike and
+    gap-boundary garbage that previously differed between train and inference.
     """
-    observed = np.asarray(observed, dtype=bool)
+    bboxes = np.asarray(bboxes, dtype=float).reshape(-1, 4)
+    scores = np.asarray(scores, dtype=float).reshape(-1)
+    observed = np.asarray(observed, dtype=bool).reshape(-1)
     n = len(bboxes)
     feat = np.zeros((n, ADAPTIVE_KALMAN_FEATURE_DIM), dtype=np.float32)
-    feat[:, :12] = compute_motion_features(bboxes)
-    feat[:, ADAPTIVE_KALMAN_SCORE_IDX] = scores
-    feat[~observed, :12] = 0.0
-    feat[~observed, ADAPTIVE_KALMAN_SCORE_IDX] = 0.0
+    for i in range(n):
+        if not observed[i]:
+            continue
+        feat[i, :4] = bboxes[i]
+        feat[i, ADAPTIVE_KALMAN_SCORE_IDX] = scores[i]
+        if i >= 1 and observed[i - 1]:
+            feat[i, 4:8] = bboxes[i] - bboxes[i - 1]
+            if i >= 2 and observed[i - 2]:
+                feat[i, 8:12] = (bboxes[i] - bboxes[i - 1]) - (bboxes[i - 1] - bboxes[i - 2])
 
     gap = 0.0
     for i in range(n):
