@@ -81,7 +81,7 @@ class _AdaptiveKalmanHead(nn.Module):
         
         self.q_head = nfc(
             n_layers=3,
-            input_dim=hidden_dim,
+            input_dim=hidden_dim + 1,
             output_dim=4,
             dropout=dropout * 0.5
         )
@@ -101,14 +101,13 @@ class _AdaptiveKalmanHead(nn.Module):
         # nn.init.zeros_(self.r_residual_head.weight)
         # nn.init.zeros_(self.r_residual_head.bias)
 
-    def forward(
-        self, hidden: torch.Tensor, scores: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        log_var_q = self.q_head(hidden)
+    def predict_q(self, hidden: torch.Tensor, prediction_gap: torch.Tensor) -> torch.Tensor:
+        return self.q_head(torch.cat([hidden, prediction_gap], dim=-1))
+
+    def predict_r(self, hidden: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         log_r_prior = confidence_log_r_prior(scores, alpha=self.conf_alpha)
         delta = self.r_residual_head(hidden).clamp(-6.0, 6.0)
-        log_var_r = (log_r_prior + delta).clamp(-16.0, 8.0)
-        return log_var_q, log_var_r
+        return (log_r_prior + delta).clamp(-16.0, 8.0)
 
 
 
@@ -127,11 +126,13 @@ class AdaptiveKalmanTransformer(nn.Module):
         dim_ff: int = 1024,
         dropout: float = 0.1,
         conf_alpha: float = 2.0,
+        max_gap_norm: float = 30.0,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.d_model = d_model
         self.conf_alpha = conf_alpha
+        self.max_gap_norm = float(max_gap_norm)
 
         self.in_fc = nfc(
             n_layers=3,
@@ -185,20 +186,32 @@ class AdaptiveKalmanTransformer(nn.Module):
         return out[:, -ctx.size(1):, :]
 
     @torch.no_grad()
-    def predict_noise(
+    def predict_q(
         self,
         src: torch.Tensor,
+        prediction_gap: torch.Tensor,
         src_key_padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Single-step Q/R from observation history. ``src``'s last row must be the
         current (most recent) step — pad any shorter sequences at the front.
         """
         ctx = src[:, -1:, :].clone()
         hidden = self._encode(src, ctx, src_key_padding_mask)
-        scores = ctx[..., 12:13]
-        log_q, log_r = self.head(hidden[:, -1:, :], scores)
-        return log_q[:, 0, :], log_r[:, 0, :]
+        gap = prediction_gap.reshape(src.size(0), 1, 1).to(src)
+        return self.head.predict_q(hidden[:, -1:, :], gap)[:, 0, :]
+
+    @torch.no_grad()
+    def predict_r(
+        self,
+        src: torch.Tensor,
+        measurement: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hidden = self._encode(src, measurement, src_key_padding_mask)
+        return self.head.predict_r(
+            hidden[:, -1:, :], measurement[..., 12:13]
+        )[:, 0, :]
 
     def save_weight(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -221,10 +234,12 @@ class AdaptiveKalmanLSTM(nn.Module):
         dropout: float = 0.1,
         conf_alpha: float = 2.0,
         teacher_forcing_ratio: float = 0.5,
+        max_gap_norm: float = 30.0,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.max_gap_norm = float(max_gap_norm)
 
         self.in_fc = nn.Sequential(
             nn.Linear(input_dim, d_model // 4),
@@ -244,18 +259,26 @@ class AdaptiveKalmanLSTM(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.head = _AdaptiveKalmanHead(hidden_dim, conf_alpha=conf_alpha)
+        self.head = _AdaptiveKalmanHead(
+            hidden_dim, dropout, conf_alpha=conf_alpha
+        )
 
     @torch.no_grad()
-    def predict_noise(self, src: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def predict_q(self, src: torch.Tensor, prediction_gap: torch.Tensor) -> torch.Tensor:
         """Single-step Q/R; ``src``'s last row must be the current step (no padding mask)."""
         src_embed = self.in_fc(src)
         _, (h, c) = self.lstm(src_embed)
         prev = src[:, -1:, :]
         out, (h, c) = self.lstm(self.in_fc(prev), (h, c))
-        score = prev[:, :, 12:13]
-        log_q, log_r = self.head(out, score)
-        return log_q[:, 0, :], log_r[:, 0, :]
+        gap = prediction_gap.reshape(src.size(0), 1, 1).to(src)
+        return self.head.predict_q(out, gap)[:, 0, :]
+
+    @torch.no_grad()
+    def predict_r(self, src: torch.Tensor, measurement: torch.Tensor) -> torch.Tensor:
+        src_embed = self.in_fc(src)
+        _, (h, c) = self.lstm(src_embed)
+        out, (h, c) = self.lstm(self.in_fc(measurement), (h, c))
+        return self.head.predict_r(out, measurement[..., 12:13])[:, 0, :]
 
     def save_weight(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

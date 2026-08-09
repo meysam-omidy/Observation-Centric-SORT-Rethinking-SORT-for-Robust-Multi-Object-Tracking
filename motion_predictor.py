@@ -81,7 +81,7 @@ def build_model(cfg: MotionPredictorConfig, device: torch.device) -> torch.nn.Mo
 
 def _load_adaptive_kalman(
     cfg: MotionPredictorConfig, device: torch.device
-) -> tuple[torch.nn.Module, str, float]:
+) -> tuple[torch.nn.Module, str, float, int]:
     """
     Load a motion-predictor checkpoint (best_model.pth: model_state_dict + args) and
     rebuild the matching architecture — mirrors eval_adaptive_kalman.load_model_and_config
@@ -89,6 +89,12 @@ def _load_adaptive_kalman(
     """
     ckpt = torch.load(cfg.weights_path, map_location=device, weights_only=False)
     train_args = ckpt.get('args', {}) if isinstance(ckpt, dict) else {}
+    version = ckpt.get('adaptive_qr_version', 1) if isinstance(ckpt, dict) else 1
+    if version < 2:
+        raise ValueError(
+            'Adaptive Kalman checkpoint predates the causal two-stage Q/R interface; '
+            'retrain it with adaptive_qr_version=2.'
+        )
     model_type = ckpt.get('model_type') or train_args.get('model_type', 'transformer')
 
     model_kw = dict(
@@ -96,6 +102,11 @@ def _load_adaptive_kalman(
         d_model=train_args.get('d_model', 256),
         dropout=train_args.get('dropout', 0.1),
         conf_alpha=train_args.get('conf_alpha', 2.0),
+        max_gap_norm=(
+            cfg.max_gap_norm
+            if cfg.max_gap_norm is not None
+            else train_args.get('max_gap_norm', 30.0)
+        ),
     )
     if model_type == 'transformer':
         model_kw.update(
@@ -117,7 +128,10 @@ def _load_adaptive_kalman(
     max_gap_norm = (
         cfg.max_gap_norm if cfg.max_gap_norm is not None else train_args.get('max_gap_norm', 30.0)
     )
-    return model, model_type, max_gap_norm
+    history_len = int(ckpt.get('history_len', train_args.get('seq_in_len', 30)))
+    if history_len < 2:
+        raise ValueError('adaptive_kalman history_len must be at least 2')
+    return model, model_type, max_gap_norm, history_len
 
 
 class MotionPredictorEngine:
@@ -131,13 +145,74 @@ class MotionPredictorEngine:
                 f'Motion predictor weights not found: {cfg.weights_path}'
             )
         if cfg.model_type == 'adaptive_kalman':
-            self.model, self.adaptive_model_type, self.max_gap_norm = _load_adaptive_kalman(
-                cfg, self.device
-            )
+            (
+                self.model,
+                self.adaptive_model_type,
+                self.max_gap_norm,
+                self.history_len,
+            ) = _load_adaptive_kalman(cfg, self.device)
         else:
             self.model = build_model(cfg, self.device)
             self.model.load_weight(cfg.weights_path, map_location=str(self.device))
             self.model.eval()
+
+    @torch.no_grad()
+    def predict_q_batch(
+        self,
+        src: np.ndarray,
+        valid_lens: list[int],
+        prediction_gaps: np.ndarray,
+    ) -> torch.Tensor:
+        """Causal process noise before association."""
+        if self.cfg.model_type != 'adaptive_kalman':
+            raise ValueError('predict_q_batch is only valid for adaptive_kalman')
+        t = torch.as_tensor(src, dtype=torch.float32, device=self.device)
+        gaps = torch.as_tensor(prediction_gaps, dtype=torch.float32, device=self.device)
+        B, T, _ = t.shape
+        if self.adaptive_model_type == 'transformer':
+            pad = torch.zeros(B, T, dtype=torch.bool, device=self.device)
+            for i, L in enumerate(valid_lens):
+                if L < T:
+                    pad[i, :T - L] = True
+            log_q = self.model.predict_q(t, gaps, src_key_padding_mask=pad)
+        else:
+            # The LSTM has no padding mask. Slice each row so leading padding can
+            # never alter its hidden state or make predictions batch-dependent.
+            rows = [
+                self.model.predict_q(t[i:i + 1, T - L:], gaps[i:i + 1])[0]
+                for i, L in enumerate(valid_lens)
+            ]
+            log_q = torch.stack(rows)
+        return exp_var(log_q)
+
+    @torch.no_grad()
+    def predict_r_batch(
+        self,
+        src: np.ndarray,
+        valid_lens: list[int],
+        measurements: np.ndarray,
+    ) -> torch.Tensor:
+        """Measurement noise after association, conditioned on matched detections."""
+        if self.cfg.model_type != 'adaptive_kalman':
+            raise ValueError('predict_r_batch is only valid for adaptive_kalman')
+        t = torch.as_tensor(src, dtype=torch.float32, device=self.device)
+        meas = torch.as_tensor(
+            measurements, dtype=torch.float32, device=self.device
+        ).unsqueeze(1)
+        B, T, _ = t.shape
+        if self.adaptive_model_type == 'transformer':
+            pad = torch.zeros(B, T, dtype=torch.bool, device=self.device)
+            for i, L in enumerate(valid_lens):
+                if L < T:
+                    pad[i, :T - L] = True
+            log_r = self.model.predict_r(t, meas, src_key_padding_mask=pad)
+        else:
+            rows = [
+                self.model.predict_r(t[i:i + 1, T - L:], meas[i:i + 1])[0]
+                for i, L in enumerate(valid_lens)
+            ]
+            log_r = torch.stack(rows)
+        return exp_var(log_r)
 
     @torch.no_grad()
     def predict_batch(
@@ -157,17 +232,10 @@ class MotionPredictorEngine:
 
         mt = self.cfg.model_type
         if mt == 'adaptive_kalman':
-            # ocsort.py left-pads this model type (data right-aligned) so the last row
-            # of `t` is always the current step, matching predict_noise's expectation.
-            pad = torch.zeros(B, T, dtype=torch.bool, device=self.device)
-            for i, L in enumerate(valid_lens):
-                if L < T:
-                    pad[i, :T - L] = True
-            if self.adaptive_model_type == 'transformer':
-                log_q, log_r = self.model.predict_noise(t, src_key_padding_mask=pad)
-            else:
-                log_q, log_r = self.model.predict_noise(t)
-            return None, exp_var(log_q), exp_var(log_r)
+            raise ValueError(
+                'adaptive_kalman uses predict_q_batch before association and '
+                'predict_r_batch after matching'
+            )
 
         pad = torch.zeros(B, T, dtype=torch.bool, device=self.device)
         for i, L in enumerate(valid_lens):

@@ -183,5 +183,5 @@ def evaluate(dataset, split, trackers_to_eval=None, datasets_dir=None):
 
 if __name__ == '__main__':
     # evaluate('MOT20', 'val')
-    evaluate('MOT17', 'val')
-    # evaluate('DanceTrack', 'train')
+    # evaluate('MOT17', 'val')
+    evaluate('DanceTrack', 'val')

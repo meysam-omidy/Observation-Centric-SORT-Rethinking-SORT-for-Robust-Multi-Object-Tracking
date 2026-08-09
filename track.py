@@ -110,8 +110,12 @@ class Track:
             
     @property
     def k_last_updates(self) -> list:
+        return self.history_items(self.config.update_window_end)
+
+    def history_items(self, window: int) -> list:
+        """Completed-frame items, preferring real/virtual updates over predictions."""
         k_last = []
-        for i in range(self.current_frame - self.config.update_window_end, self.current_frame):
+        for i in range(self.current_frame - int(window), self.current_frame):
             if i in self.history.update:
                 k_last.append(self.history.update[i])
             elif i in self.history.predict:
@@ -258,7 +262,8 @@ class Track:
             
     def update(self, 
                bbox : Union[list, np.ndarray], 
-               score : float):
+               score : float,
+               var_r: np.ndarray = None):
         require_reupdate = False
         if self.age > 1:
             require_reupdate = True
@@ -276,7 +281,9 @@ class Track:
                 self.kf.update(z, R=R)
             else:
                 pred_item = self.history.predict.get(self.current_frame)
-                var_r = pred_item.var_r if pred_item is not None else None
+                if var_r is None:
+                    # Backward-compatible fallback for older one-stage predictors.
+                    var_r = pred_item.var_r if pred_item is not None else None
                 if var_r is not None:
                     xywh_obs = BBOX.from_tlbr(bbox)
                     R = learned_measurement_noise_matrix(

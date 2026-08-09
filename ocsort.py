@@ -82,11 +82,9 @@ class OCSORTTracker:
             self.config.match_high_score_dets_with_confirmed_trks_threshold,
             phase=1
         )
-        for t_i, d_i in matches:
-            confirmed_tracks[t_i].update(
-                high_confidence_detections[d_i], 
-                score=float(high_scores[d_i])
-            )
+        self._update_matches(
+            confirmed_tracks, high_confidence_detections, high_scores, matches
+        )
 
         if self.config.use_byte:
             remained_confirmed_tracks = select_indices(confirmed_tracks, unmatched_confirmed_track_indices)
@@ -99,11 +97,9 @@ class OCSORTTracker:
                 self.config.match_low_score_dets_with_confirmed_trks_threshold,
                 phase=2
             )
-            for t_i, d_i in matches:
-                remained_tracking_tracks[t_i].update(
-                    low_confidence_detections[d_i], 
-                    score=float(low_scores[d_i])
-                )
+            self._update_matches(
+                remained_tracking_tracks, low_confidence_detections, low_scores, matches
+            )
 
         remained_high_confidence_detections = select_indices(high_confidence_detections, unmatched_high_confidence_detection_indices)
         remained_high_scores = select_indices(high_scores, unmatched_high_confidence_detection_indices)
@@ -115,11 +111,12 @@ class OCSORTTracker:
             self.config.match_remained_high_score_dets_with_unconfirmed_trks_threshold,
             phase=3
         )
-        for t_i, d_i in matches:
-            unconfirmed_tracks[t_i].update(
-                remained_high_confidence_detections[d_i], 
-                score=float(remained_high_scores[d_i])
-            )
+        self._update_matches(
+            unconfirmed_tracks,
+            remained_high_confidence_detections,
+            remained_high_scores,
+            matches,
+        )
         
         unmatched_remained_high_score_detections = select_indices(remained_high_confidence_detections, unmatched_remained_high_score_detection_indices)
         unmatched_remained_high_scores = select_indices(remained_high_scores, unmatched_remained_high_score_detection_indices)
@@ -147,22 +144,101 @@ class OCSORTTracker:
         ]
         return np.array(diffs).mean(axis=0) + k_last_updates[-1].bbox
 
+    @property
+    def _use_adaptive_kalman(self) -> bool:
+        return (
+            self.motion_engine is not None
+            and self.motion_engine.cfg.model_type == 'adaptive_kalman'
+        )
+
+    def _adaptive_context(self, track):
+        """Fixed-size completed-frame context matching training exactly."""
+        history_len = self.motion_engine.history_len
+        items = (
+            track.history_items(history_len)
+            if hasattr(track, 'history_items')
+            else track.k_last_updates[-history_len:]
+        )
+        if len(items) < history_len:
+            return None
+        items = items[-history_len:]
+        boxes = np.asarray([item.bbox for item in items], dtype=float)
+        boxes /= np.array(
+            [self.config.image_width, self.config.image_height,
+             self.config.image_width, self.config.image_height],
+            dtype=float,
+        )
+        scores = np.asarray([item.score for item in items], dtype=float)
+        observed = np.asarray([item.observed for item in items], dtype=bool)
+        features = compute_adaptive_kalman_features(
+            boxes, scores, observed, self.motion_engine.max_gap_norm
+        )
+        return boxes, scores, observed, features
+
+    def _measurement_feature(self, context, detection, score):
+        boxes, scores, observed, _ = context
+        current = np.asarray(BBOX.from_tlbr(detection), dtype=float)
+        current /= np.array(
+            [self.config.image_width, self.config.image_height,
+             self.config.image_width, self.config.image_height],
+            dtype=float,
+        )
+        ext = compute_adaptive_kalman_features(
+            np.concatenate([boxes, current[None]], axis=0),
+            np.concatenate([scores, [float(score)]]),
+            np.concatenate([observed, [True]]),
+            self.motion_engine.max_gap_norm,
+        )
+        return ext[-1]
+
+    def _update_matches(self, tracks, detections, scores, matches):
+        """Condition R on each matched current detection, then perform KF update."""
+        var_rs = [None] * len(matches)
+        if self._use_adaptive_kalman and not self.config.use_confidence_r and matches:
+            rows, measurements, valid_positions = [], [], []
+            for pos, (t_i, d_i) in enumerate(matches):
+                context = self._adaptive_context(tracks[t_i])
+                if context is None:
+                    continue
+                rows.append(context[3])
+                measurements.append(
+                    self._measurement_feature(
+                        context, detections[d_i], float(scores[d_i])
+                    )
+                )
+                valid_positions.append(pos)
+            if rows:
+                batched = np.stack(rows).astype(np.float32, copy=False)
+                lens = [self.motion_engine.history_len] * len(rows)
+                predicted = self.motion_engine.predict_r_batch(
+                    batched, lens, np.stack(measurements)
+                ).cpu().numpy()
+                for pos, var_r in zip(valid_positions, predicted):
+                    var_rs[pos] = var_r
+
+        for pos, (t_i, d_i) in enumerate(matches):
+            tracks[t_i].update(
+                detections[d_i],
+                score=float(scores[d_i]),
+                var_r=var_rs[pos],
+            )
+
     def predict_tracks(self):
         self.frame_number += 1
         for track in self.get_tracks([StateTracking, StateLost, StateUnconfirmed]):
             track.predict()
 
-        use_adaptive = (
-            self.motion_engine is not None and self.motion_engine.cfg.model_type == 'adaptive_kalman'
-        )
+        use_adaptive = self._use_adaptive_kalman
 
         tracks_batch = []
         cv_bboxes = []
         srcs = []
         valid_lens = []
+        prediction_gaps = []
         max_len = 0
         for track in self.get_tracks([StateTracking, StateLost, StateUnconfirmed]):
             k_last_updates = track.k_last_updates
+            adaptive_context = self._adaptive_context(track) if use_adaptive else None
             if len(k_last_updates) == 1:
                 it0 = k_last_updates[0]
                 track.set_prediction_from_motion(
@@ -171,7 +247,11 @@ class OCSORTTracker:
                     var_q=None,
                     var_r=None,
                 )
-            elif len(k_last_updates) < self.config.update_window_start:
+            elif (
+                adaptive_context is None
+                if use_adaptive
+                else len(k_last_updates) < self.config.update_window_start
+            ):
                 track.set_prediction_from_motion(
                     self._cv_bbox(k_last_updates),
                     track.score,
@@ -179,45 +259,53 @@ class OCSORTTracker:
                     var_r=None,
                 )
             else:
-                boxes = np.array([k_last_update.bbox for k_last_update in k_last_updates])
-                scores = np.array([k_last_update.score for k_last_update in k_last_updates])
-                boxes[:, 0] /= self.config.image_width
-                boxes[:, 1] /= self.config.image_height
-                boxes[:, 2] /= self.config.image_width
-                boxes[:, 3] /= self.config.image_height
-                L = len(boxes)
-                max_len = max(max_len, L)
                 tracks_batch.append(track)
                 cv_bboxes.append(self._cv_bbox(k_last_updates))
                 if use_adaptive:
-                    observed = np.array([k_last_update.observed for k_last_update in k_last_updates])
-                    srcs.append(
-                        compute_adaptive_kalman_features(
-                            boxes, scores, observed, self.motion_engine.max_gap_norm
-                        )
+                    srcs.append(adaptive_context[3])
+                    L = self.motion_engine.history_len
+                    # track.predict() has already incremented age for this frame.
+                    prediction_gaps.append(
+                        min(track.age / self.motion_engine.max_gap_norm, 1.0)
                     )
                 else:
+                    boxes = np.array([item.bbox for item in k_last_updates])
+                    scores = np.array([item.score for item in k_last_updates])
+                    boxes[:, 0] /= self.config.image_width
+                    boxes[:, 1] /= self.config.image_height
+                    boxes[:, 2] /= self.config.image_width
+                    boxes[:, 3] /= self.config.image_height
+                    L = len(boxes)
                     srcs.append((compute_motion_features(boxes), scores))
                 valid_lens.append(L)
+                max_len = max(max_len, L)
 
         if len(tracks_batch) > 0:
-            feature_dim = 15 if use_adaptive else 13
-            batched = np.zeros(shape=(len(tracks_batch), max_len, feature_dim), dtype=np.float32)
-            for i, L in enumerate(valid_lens):
-                if use_adaptive:
-                    # Left-pad (right-align): the model reads its "current step" off
-                    # the last row, so the real data must sit at the tail.
-                    batched[i, max_len - L:, :] = srcs[i]
-                else:
+            if use_adaptive:
+                # Fixed length from the checkpoint: positional encodings no longer
+                # depend on which other tracks happen to share this frame's batch.
+                batched = np.stack(srcs).astype(np.float32, copy=False)
+            else:
+                batched = np.zeros(
+                    shape=(len(tracks_batch), max_len, 13), dtype=np.float32
+                )
+                for i, L in enumerate(valid_lens):
                     motion12, scores = srcs[i]
                     batched[i, :L, :12] = motion12
                     batched[i, :L, 12] = scores
 
-            preds_t, var_q_t, var_r_t = (
-                self.motion_engine.predict_batch(batched, valid_lens)
-                if self.motion_engine is not None
-                else (None, None, None)
-            )
+            if use_adaptive:
+                preds_t = None
+                var_q_t = self.motion_engine.predict_q_batch(
+                    batched, valid_lens, np.asarray(prediction_gaps, dtype=np.float32)
+                )
+                var_r_t = None
+            else:
+                preds_t, var_q_t, var_r_t = (
+                    self.motion_engine.predict_batch(batched, valid_lens)
+                    if self.motion_engine is not None
+                    else (None, None, None)
+                )
             preds = None
             if preds_t is not None:
                 preds = preds_t.cpu().numpy()
