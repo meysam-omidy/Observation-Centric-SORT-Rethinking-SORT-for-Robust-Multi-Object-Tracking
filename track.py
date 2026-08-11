@@ -3,7 +3,7 @@ import textwrap
 from track_state import StateUnconfirmed, StateTracking, StateLost, StateDeleted, TrackState
 from utils import BBOX, get_dict_item, get_dict_key, batch_speed_direction, tlbr_to_z, bbox_xywh_to_z, z_to_bbox_xywh
 from kalman_filter import create_sort_kalman, learned_measurement_noise_matrix, learned_process_noise_matrix
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Union, Literal
 
 class TrackConfig(BaseModel):
@@ -19,6 +19,8 @@ class TrackConfig(BaseModel):
     kalman_fusion_blend : float = 1.0
     use_oru : bool = False
     use_confidence_r : bool = False
+    q_scale : float = Field(default=1.0, gt=0)
+    r_scale : float = Field(default=1.0, gt=0)
 
 
 class TrackHistoryItem:
@@ -234,7 +236,7 @@ class Track:
             return
         Q = None
         if var_q is not None:
-            Q = learned_process_noise_matrix(
+            Q = self.config.q_scale * learned_process_noise_matrix(
                 var_q,
                 xywh,
                 self.config.image_width,
@@ -286,7 +288,7 @@ class Track:
                     var_r = pred_item.var_r if pred_item is not None else None
                 if var_r is not None:
                     xywh_obs = BBOX.from_tlbr(bbox)
-                    R = learned_measurement_noise_matrix(
+                    R = self.config.r_scale * learned_measurement_noise_matrix(
                         var_r,
                         xywh_obs,
                         self.config.image_width,

@@ -14,13 +14,16 @@ Example:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import threading
 
 import numpy as np
 import configparser
 
 from ocsort import OCSORTTracker
 from evaluate import evaluate
+from motion_predictor import MotionPredictorConfig, MotionPredictorEngine
 from utils import count_time
 
 
@@ -28,6 +31,41 @@ def collect_seqs(args) -> list[str]:
     if args.seqs:
         return args.seqs
     return sorted(os.listdir(f'{args.datasets_dir}/{args.dataset}/{args.split}/'))
+
+
+def motion_config(args) -> dict:
+    return {
+        'enabled': args.motion_enabled,
+        'model_type': args.model_type,
+        'weights_path': args.weights_path,
+        'device': args.device,
+        'use_kalman': args.use_kalman,
+        'kalman_fusion_blend': args.kalman_fusion_blend,
+        'max_gap_norm': args.max_gap_norm,
+    }
+
+
+class LockedMotionPredictorEngine:
+    """Share one read-only model safely between sequence worker threads."""
+
+    def __init__(self, engine: MotionPredictorEngine):
+        self._engine = engine
+        self._inference_lock = threading.Lock()
+
+    def __getattr__(self, name):
+        return getattr(self._engine, name)
+
+    def predict_q_batch(self, *args, **kwargs):
+        with self._inference_lock:
+            return self._engine.predict_q_batch(*args, **kwargs)
+
+    def predict_r_batch(self, *args, **kwargs):
+        with self._inference_lock:
+            return self._engine.predict_r_batch(*args, **kwargs)
+
+    def predict_batch(self, *args, **kwargs):
+        with self._inference_lock:
+            return self._engine.predict_batch(*args, **kwargs)
 
 
 def tracker_config(args, image_width: str, image_height: str) -> dict:
@@ -52,42 +90,63 @@ def tracker_config(args, image_width: str, image_height: str) -> dict:
         'use_oru': args.use_oru,
         'use_confidence_r': args.use_confidence_r,
         'use_learned_q': args.use_learned_q,
+        'q_scale': args.q_scale,
+        'r_scale': args.r_scale,
         'reupdate_type': args.reupdate_type,
         'reupdate_constant_weight': args.reupdate_constant_weight,
-        'motion': {
-            'enabled': args.motion_enabled,
-            'model_type': args.model_type,
-            'weights_path': args.weights_path,
-            'device': args.device,
-            'use_kalman': args.use_kalman,
-            'kalman_fusion_blend': args.kalman_fusion_blend,
-            'max_gap_norm': args.max_gap_norm,
-        },
+        'motion': motion_config(args),
     }
 
 
 @count_time
-def run(seq: str, args) -> None:
-    print(seq)
+def run(seq: str, args, motion_engine=None) -> None:
+    print(f'[{seq}] starting')
     detections = np.loadtxt(f'{args.detections_dir}/{args.dataset}/{seq}.txt', delimiter=',')
     config = configparser.ConfigParser()
     config.read(f'{args.datasets_dir}/{args.dataset}/{args.split}/{seq}/seqinfo.ini')
-    tracker = OCSORTTracker(tracker_config(
-        args,
-        config['Sequence']['imWidth'],
-        config['Sequence']['imHeight'],
-    ))
+    tracker = OCSORTTracker(
+        tracker_config(
+            args,
+            config['Sequence']['imWidth'],
+            config['Sequence']['imHeight'],
+        ),
+        motion_engine=motion_engine,
+    )
     os.makedirs(f'outputs/{args.tracker_name}', exist_ok=True)
-    with open(f'outputs/{args.tracker_name}/{seq}.txt', 'w') as file:
-        for frame_number in range(1, int(config['Sequence']['seqLength']) + 1):
-            dets = detections[detections[:, 0] == frame_number][:, 1:]
-            tracker.update(dets)
-            for output in tracker.get_outputs():
-                file.write(f'{output}\n')
+    output_path = f'outputs/{args.tracker_name}/{seq}.txt'
+    temporary_path = f'{output_path}.tmp-{os.getpid()}-{threading.get_ident()}'
+    try:
+        with open(temporary_path, 'w') as file:
+            for frame_number in range(1, int(config['Sequence']['seqLength']) + 1):
+                dets = detections[detections[:, 0] == frame_number][:, 1:]
+                tracker.update(dets)
+                for output in tracker.get_outputs():
+                    file.write(f'{output}\n')
+        os.replace(temporary_path, output_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+    print(f'[{seq}] completed')
+
+
+def build_shared_motion_engine(args, workers: int):
+    if not args.motion_enabled:
+        return None
+    try:
+        engine = MotionPredictorEngine(MotionPredictorConfig.model_validate(motion_config(args)))
+    except FileNotFoundError as err:
+        print(f'[run_tracker] {err}; using heuristic motion prediction.')
+        args.motion_enabled = False
+        return None
+    return LockedMotionPredictorEngine(engine) if workers > 1 else engine
 
 
 def main(args) -> None:
-    seqs = collect_seqs(args)
+    # Preserve user ordering while preventing two workers from targeting the same file.
+    seqs = list(dict.fromkeys(collect_seqs(args)))
+    if not seqs:
+        raise ValueError('no sequences found')
+    workers = min(args.sequence_workers, len(seqs))
     seqmap_dir = f'./trackeval/seqmap/{args.dataset.lower()}'
     os.makedirs(seqmap_dir, exist_ok=True)
     with open(f'{seqmap_dir}/custom.txt', 'w') as seqmap:
@@ -95,9 +154,22 @@ def main(args) -> None:
         for seq in seqs:
             seqmap.write(f'{seq}\n')
 
-    print('tracking...')
-    for seq in seqs:
-        run(seq, args)
+    os.makedirs(f'outputs/{args.tracker_name}', exist_ok=True)
+    motion_engine = build_shared_motion_engine(args, workers)
+
+    print(f'tracking {len(seqs)} sequence(s) with {workers} worker(s)...')
+    if workers == 1:
+        for seq in seqs:
+            run(seq, args, motion_engine)
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='ocsort-seq') as executor:
+            futures = {
+                executor.submit(run, seq, args, motion_engine): seq
+                for seq in seqs
+            }
+            for future in as_completed(futures):
+                # Propagate worker failures and do not evaluate partial output.
+                future.result()
 
     if args.evaluate:
         print('evaluating...')
@@ -118,6 +190,10 @@ if __name__ == '__main__':
     p.add_argument('--detections_dir', type=str, default='C:/Projects/.Detections')
     p.add_argument('--tracker_name', type=str, default='ocsort-self', help='output subfolder under outputs/')
     p.add_argument('--evaluate', action='store_true', help='run trackeval (HOTA/CLEAR/Identity) after tracking')
+    p.add_argument(
+        '--sequence_workers', type=int, default=1,
+        help='number of independent dataset sequences to track concurrently',
+    )
 
     p.add_argument('--max_age', type=int, default=30)
     p.add_argument('--update_window_start', type=int, default=30)
@@ -144,6 +220,14 @@ if __name__ == '__main__':
                    help="use the model's var_q for process noise Q")
     p.add_argument('--no_use_learned_q', action='store_false', dest='use_learned_q',
                    help="ignore the model's var_q; keep the KF's fixed Q (pairs well with learned R)")
+    p.add_argument(
+        '--q_scale', type=float, default=1.0,
+        help='positive multiplier applied to the final learned Kalman Q matrix',
+    )
+    p.add_argument(
+        '--r_scale', type=float, default=1.0,
+        help='positive multiplier applied to the final learned Kalman R matrix',
+    )
     p.add_argument('--reupdate_type', type=str, default='constant', choices=['constant', 'relative', 'none'])
     p.add_argument('--reupdate_constant_weight', type=float, default=0.8)
 
@@ -171,6 +255,8 @@ if __name__ == '__main__':
     )
 
     args = p.parse_args()
+    if args.sequence_workers < 1:
+        p.error('--sequence_workers must be at least 1')
     if args.reupdate_type == 'none':
         args.reupdate_type = None
     main(args)

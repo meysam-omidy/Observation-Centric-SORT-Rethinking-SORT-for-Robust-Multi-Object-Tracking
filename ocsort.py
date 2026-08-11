@@ -31,6 +31,8 @@ class OCSORTTrackerConfig(BaseModel):
     use_oru : bool = False
     use_confidence_r : bool = False
     use_learned_q : bool = True   # False -> ignore the model's var_q, keep the KF's fixed Q
+    q_scale : float = Field(default=1.0, gt=0)
+    r_scale : float = Field(default=1.0, gt=0)
     log_path : str = None
     reupdate_type : Literal['constant', 'relative', None] = None
     reupdate_constant_weight : float = 1
@@ -38,13 +40,13 @@ class OCSORTTrackerConfig(BaseModel):
     
 
 class OCSORTTracker:
-    def __init__(self, config:dict={}):
+    def __init__(self, config:dict={}, motion_engine: MotionPredictorEngine | None = None):
         self.config = OCSORTTrackerConfig.model_validate(config)
         self.tracks : list[Track] = []
         self.frame_number = 0
         self.id_counter = 1
-        self.motion_engine : MotionPredictorEngine | None = None
-        if self.config.motion.enabled:
+        self.motion_engine = motion_engine
+        if self.config.motion.enabled and self.motion_engine is None:
             try:
                 self.motion_engine = MotionPredictorEngine(self.config.motion)
             except FileNotFoundError as err:
