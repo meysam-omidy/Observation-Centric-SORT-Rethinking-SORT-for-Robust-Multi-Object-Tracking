@@ -130,7 +130,11 @@ class Track:
 
     @property
     def mot_format(self) -> str:
-        tlwh = get_dict_item(self.history.update, -1).bbox.to_tlwh()
+        return self.mot_format_for(get_dict_item(self.history.update, -1).bbox, self.score)
+
+    def mot_format_for(self, bbox: BBOX, score: float) -> str:
+        """Format a detection or an explicitly selected predicted track state."""
+        tlwh = bbox.to_tlwh()
         return (
             f"{self.current_frame},"
             f"{int(self.id)},"
@@ -138,7 +142,7 @@ class Track:
             f"{round(tlwh[1], 1)},"
             f"{round(tlwh[2], 1)},"
             f"{round(tlwh[3], 1)},"
-            f"{round(self.score, 1)},"
+            f"{round(float(score), 1)},"
             f"-1,-1,-1"
         )
 

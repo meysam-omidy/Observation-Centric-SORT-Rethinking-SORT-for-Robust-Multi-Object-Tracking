@@ -61,27 +61,51 @@ def build_config(args, iw, ih):
         "image_width": iw, "image_height": ih,
         "max_age": args.max_age, "update_window_start": args.update_window_start,
         "update_window_end": args.update_window_end, "min_box_area": args.min_box_area,
+        "max_aspect_ratio": args.max_aspect_ratio,
         "delta_t": args.delta_t, "high_score_det_threshold": args.high_score_det_threshold,
         "low_score_det_threshold": args.low_score_det_threshold,
         "init_track_score_threshold": args.init_track_score_threshold,
-        "match_high_score_dets_with_confirmed_trks_threshold": args.match_high,
-        "match_low_score_dets_with_confirmed_trks_threshold": args.match_low,
-        "match_remained_high_score_dets_with_unconfirmed_trks_threshold": args.match_unconf,
-        "association_iou_coefficient": 1.0,
-        "association_speed_direction_coefficient": args.speed_coeff,
+        "match_high_score_dets_with_confirmed_trks_threshold": args.match_high_score_dets_with_confirmed_trks_threshold,
+        "match_low_score_dets_with_confirmed_trks_threshold": args.match_low_score_dets_with_confirmed_trks_threshold,
+        "match_remained_high_score_dets_with_unconfirmed_trks_threshold": args.match_remained_high_score_dets_with_unconfirmed_trks_threshold,
+        "association_iou_coefficient": args.association_iou_coefficient,
+        "association_speed_direction_coefficient": args.association_speed_direction_coefficient,
         "use_byte": args.use_byte, "use_oru": args.use_oru,
         "use_confidence_r": args.use_confidence_r,
-        "reupdate_type": args.reupdate_type, "reupdate_constant_weight": args.reupdate_weight,
+        "use_learned_q": args.use_learned_q,
+        "q_scale": args.q_scale, "r_scale": args.r_scale,
+        "output_lost_tracks": args.output_lost_tracks,
+        "lost_output_max_age": args.lost_output_max_age,
+        "lost_output_score_decay": args.lost_output_score_decay,
+        "lost_output_min_score": args.lost_output_min_score,
+        "lost_output_require_inside_frame": args.lost_output_require_inside_frame,
+        "reupdate_type": args.reupdate_type,
+        "reupdate_constant_weight": args.reupdate_constant_weight,
         "log_path": None,  # set per-seq
         "motion": {
             "enabled": args.motion_enabled, "model_type": args.model_type,
-            "weights_path": args.weights_path, "use_kalman": True,
+            "weights_path": args.weights_path, "device": args.device,
+            "use_kalman": args.use_kalman,
             "kalman_fusion_blend": args.kalman_fusion_blend,
+            "max_gap_norm": args.max_gap_norm,
         },
     }
 
 
 # ----------------------------- run -----------------------------
+def detection_file_path(args, seq):
+    """Return the detector-specific MOT detection file for a sequence.
+
+    Passing an empty ``--detector_name`` retains support for the former flat
+    ``<detections_dir>/<dataset>/<sequence>.txt`` layout.
+    """
+    parts = [args.detections_dir]
+    if args.detector_name:
+        parts.append(args.detector_name)
+    parts.extend([args.dataset, f"{seq}.txt"])
+    return os.path.join(*parts)
+
+
 def run_and_capture(args, seq, out_dir):
     seq_dir = f"{args.datasets_dir}/{args.dataset}/{args.split}/{seq}"
     cfg = configparser.ConfigParser(); cfg.read(f"{seq_dir}/seqinfo.ini")
@@ -92,7 +116,7 @@ def run_and_capture(args, seq, out_dir):
     conf["log_path"] = os.path.join(out_dir, f"{seq}.assoc.log")
     tracker = OCSORTTracker(conf)
 
-    det_path = f"{args.detections_dir}/{args.dataset}/{seq}.txt"
+    det_path = detection_file_path(args, seq)
     dets = np.loadtxt(det_path, delimiter=",")
 
     outputs_by_frame = {}   # frame -> [(tid, tlbr, score)]
@@ -285,35 +309,65 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Analyze a tracking run against GT to locate ID-switch causes")
     p.add_argument("--dataset", default="DanceTrack", choices=["MOT17", "MOT20", "DanceTrack", "SportsMOT"])
     p.add_argument("--split", default="val")
-    p.add_argument("--seqs", nargs="*", default=["dancetrack0029"])
+    p.add_argument("--seqs", nargs="*", default=["dancetrack0065"])
     p.add_argument("--name", default="new_impl", help="output subfolder under analysis/")
     p.add_argument("--datasets_dir", default="C:/Projects/.Datasets")
-    p.add_argument("--detections_dir", default="C:/Projects/.Detections")
+    p.add_argument(
+        "--detections_dir",
+        default="C:/Projects/.Detections",
+        help="Root directory containing detector-specific detection folders.",
+    )
+    p.add_argument(
+        "--detector_name",
+        default="YOLOXx",
+        help="Detector subfolder under --detections_dir (e.g. YOLO11x, YOLO26x, YOLOXx).",
+    )
     p.add_argument("--match_iou", type=float, default=0.5)
-    # tracker config (defaults = current 'new implementation')
+    # Tracker options: kept in parity with run_tracker.py so an analysis run
+    # reproduces the same tracker behaviour.
     p.add_argument("--max_age", type=int, default=30)
     p.add_argument("--update_window_start", type=int, default=30)
-    p.add_argument("--update_window_end", type=int, default=50)
+    p.add_argument("--update_window_end", type=int, default=90)
     p.add_argument("--min_box_area", type=int, default=100)
+    p.add_argument("--max_aspect_ratio", type=float, default=1.6)
     p.add_argument("--delta_t", type=int, default=3)
     p.add_argument("--high_score_det_threshold", type=float, default=0.6)
     p.add_argument("--low_score_det_threshold", type=float, default=0.1)
     p.add_argument("--init_track_score_threshold", type=float, default=0.6)
-    p.add_argument("--match_high", type=float, default=0.2)
-    p.add_argument("--match_low", type=float, default=0.5)
-    p.add_argument("--match_unconf", type=float, default=0.3)
-    p.add_argument("--speed_coeff", type=float, default=0.0)
+    p.add_argument("--match_high_score_dets_with_confirmed_trks_threshold", type=float, default=0.2)
+    p.add_argument("--match_low_score_dets_with_confirmed_trks_threshold", type=float, default=0.5)
+    p.add_argument("--match_remained_high_score_dets_with_unconfirmed_trks_threshold", type=float, default=0.3)
+    p.add_argument("--association_iou_coefficient", type=float, default=1.0)
+    p.add_argument("--association_speed_direction_coefficient", type=float, default=0.3)
     p.add_argument("--use_byte", action="store_true", default=True)
     p.add_argument("--no_use_byte", action="store_false", dest="use_byte")
-    p.add_argument("--use_oru", action="store_true", default=False)
+    p.add_argument("--use_oru", action="store_true", default=True)
+    p.add_argument("--no_use_oru", action="store_false", dest="use_oru")
     p.add_argument("--use_confidence_r", action="store_true", default=False)
-    p.add_argument("--reupdate_type", default="relative", choices=["constant", "relative", "none"])
-    p.add_argument("--reupdate_weight", type=float, default=0.8)
+    p.add_argument("--use_learned_q", action="store_true", default=True)
+    p.add_argument("--no_use_learned_q", action="store_false", dest="use_learned_q")
+    p.add_argument("--q_scale", type=float, default=1.0)
+    p.add_argument("--r_scale", type=float, default=1.0)
+    p.add_argument("--output_lost_tracks", action="store_true", default=False)
+    p.add_argument("--lost_output_max_age", type=int, default=3)
+    p.add_argument("--lost_output_score_decay", type=float, default=0.7)
+    p.add_argument("--lost_output_min_score", type=float, default=0.3)
+    p.add_argument("--lost_output_require_inside_frame", action="store_true", default=True)
+    p.add_argument("--lost_output_allow_partial_outside", action="store_false",
+                   dest="lost_output_require_inside_frame")
+    p.add_argument("--reupdate_type", default="constant", choices=["constant", "relative", "none"])
+    p.add_argument("--reupdate_constant_weight", type=float, default=0.8)
     p.add_argument("--motion_enabled", action="store_true", default=True)
     p.add_argument("--no_motion", action="store_false", dest="motion_enabled")
-    p.add_argument("--model_type", default="adaptive_kalman")
-    p.add_argument("--weights_path", default="../motion-predictor/checkpoints/adaptive_kalman_real_all/best_model.pth")
+    p.add_argument("--model_type", default="adaptive_kalman",
+                   choices=["transformer", "transformer_learned", "lstm", "lstm_learned", "adaptive_kalman"])
+    p.add_argument("--weights_path", default="../motion-predictor/checkpoints/adaptive_kalman_real_low_data/best_model.pth")
+    p.add_argument("--device", default=None, help="cuda | cpu | mps; default = auto")
+    p.add_argument("--use_kalman", action="store_true", default=True)
+    p.add_argument("--no_use_kalman", action="store_false", dest="use_kalman")
     p.add_argument("--kalman_fusion_blend", type=float, default=0.0)
+    p.add_argument("--max_gap_norm", type=float, default=None,
+                   help="adaptive_kalman only; None = read from checkpoint (falls back to 30.0)")
     args = p.parse_args()
     if args.reupdate_type == "none":
         args.reupdate_type = None

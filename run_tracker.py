@@ -92,16 +92,30 @@ def tracker_config(args, image_width: str, image_height: str) -> dict:
         'use_learned_q': args.use_learned_q,
         'q_scale': args.q_scale,
         'r_scale': args.r_scale,
+        'output_lost_tracks': args.output_lost_tracks,
+        'lost_output_max_age': args.lost_output_max_age,
+        'lost_output_score_decay': args.lost_output_score_decay,
+        'lost_output_min_score': args.lost_output_min_score,
+        'lost_output_require_inside_frame': args.lost_output_require_inside_frame,
         'reupdate_type': args.reupdate_type,
         'reupdate_constant_weight': args.reupdate_constant_weight,
         'motion': motion_config(args),
     }
 
 
+def detection_file_path(args, seq: str) -> str:
+    """Resolve <detections_dir>/<detector_name>/<dataset>/<sequence>.txt."""
+    parts = [args.detections_dir]
+    if args.detector_name:
+        parts.append(args.detector_name)
+    parts.extend([args.dataset, f'{seq}.txt'])
+    return os.path.join(*parts)
+
+
 @count_time
 def run(seq: str, args, motion_engine=None) -> None:
     print(f'[{seq}] starting')
-    detections = np.loadtxt(f'{args.detections_dir}/{args.dataset}/{seq}.txt', delimiter=',')
+    detections = np.loadtxt(detection_file_path(args, seq), delimiter=',')
     config = configparser.ConfigParser()
     config.read(f'{args.datasets_dir}/{args.dataset}/{args.split}/{seq}/seqinfo.ini')
     tracker = OCSORTTracker(
@@ -175,7 +189,7 @@ def main(args) -> None:
         print('evaluating...')
         evaluate(
             args.dataset, args.split,
-            trackers_to_eval=[args.tracker_name, 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt', 'dl-confr'],
+            trackers_to_eval=[args.tracker_name, 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt'],
             datasets_dir=args.datasets_dir,
         )
 
@@ -187,7 +201,10 @@ if __name__ == '__main__':
     p.add_argument('--split', type=str, default='val')
     p.add_argument('--seqs', type=str, nargs='*', default=None, help='specific sequence names; default = whole split')
     p.add_argument('--datasets_dir', type=str, default='C:/Projects/.Datasets')
-    p.add_argument('--detections_dir', type=str, default='C:/Projects/.Detections')
+    p.add_argument('--detections_dir', type=str, default='C:/Projects/.Detections',
+                   help='root directory containing detector subfolders')
+    p.add_argument('--detector_name', type=str, default='YOLOX',
+                   help='detector subfolder under --detections_dir, e.g. YOLO11x, YOLO26x, YOLOX')
     p.add_argument('--tracker_name', type=str, default='ocsort-self', help='output subfolder under outputs/')
     p.add_argument('--evaluate', action='store_true', help='run trackeval (HOTA/CLEAR/Identity) after tracking')
     p.add_argument(
@@ -221,13 +238,26 @@ if __name__ == '__main__':
     p.add_argument('--no_use_learned_q', action='store_false', dest='use_learned_q',
                    help="ignore the model's var_q; keep the KF's fixed Q (pairs well with learned R)")
     p.add_argument(
-        '--q_scale', type=float, default=1.0,
+        '--q_scale', type=float, default=1,
         help='positive multiplier applied to the final learned Kalman Q matrix',
     )
     p.add_argument(
-        '--r_scale', type=float, default=1.0,
+        '--r_scale', type=float, default=1,
         help='positive multiplier applied to the final learned Kalman R matrix',
     )
+    p.add_argument('--output_lost_tracks', action='store_true', default=False,
+                   help='emit short-lived predicted boxes for confirmed tracks that miss detections')
+    p.add_argument('--lost_output_max_age', type=int, default=3,
+                   help='maximum consecutive missed frames to emit when --output_lost_tracks is enabled')
+    p.add_argument('--lost_output_score_decay', type=float, default=0.7,
+                   help='per-missed-frame multiplier for a predicted track output score')
+    p.add_argument('--lost_output_min_score', type=float, default=0.3,
+                   help='do not emit a predicted track once its decayed score is below this value')
+    p.add_argument('--lost_output_require_inside_frame', action='store_true', default=True,
+                   help='only emit a lost prediction when its whole box remains inside the frame')
+    p.add_argument('--lost_output_allow_partial_outside', action='store_false',
+                   dest='lost_output_require_inside_frame',
+                   help='allow lost-track predictions whose boxes partially leave the frame')
     p.add_argument('--reupdate_type', type=str, default='constant', choices=['constant', 'relative', 'none'])
     p.add_argument('--reupdate_constant_weight', type=float, default=0.8)
 

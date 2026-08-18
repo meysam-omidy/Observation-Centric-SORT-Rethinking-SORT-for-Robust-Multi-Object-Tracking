@@ -79,6 +79,56 @@ class AdaptiveTrackerContractTest(unittest.TestCase):
         self.assertEqual(tracker.tracks[0].config.q_scale, 0.25)
         self.assertEqual(tracker.tracks[0].config.r_scale, 0.05)
 
+    def test_lost_track_output_is_opt_in_and_decays_prediction_score(self):
+        base_config = {
+            'motion': {'enabled': False},
+            'min_box_area': 1,
+            'lost_output_max_age': 3,
+            'lost_output_score_decay': 0.7,
+            'lost_output_min_score': 0.1,
+        }
+        detections = np.array([
+            [10.0, 10.0, 30.0, 30.0, 0.9],
+        ])
+
+        disabled = OCSORTTracker(base_config)
+        disabled.update(detections)
+        disabled.update(np.empty((0, 5)))
+        # Legacy output behaviour is unchanged while the feature is disabled.
+        self.assertEqual(len(disabled.get_outputs()), 1)
+
+        tracker = OCSORTTracker({**base_config, 'output_lost_tracks': True})
+        tracker.update(detections)
+        tracker.update(np.empty((0, 5)))
+        first_gap_output = tracker.get_outputs()
+        self.assertEqual(len(first_gap_output), 1)
+        self.assertEqual(first_gap_output[0].split(',')[6], '0.6')  # 0.9 * 0.7
+
+        tracker.update(np.empty((0, 5)))
+        self.assertEqual(tracker.get_outputs()[0].split(',')[6], '0.4')
+        tracker.update(np.empty((0, 5)))
+        self.assertEqual(tracker.get_outputs()[0].split(',')[6], '0.3')
+        tracker.update(np.empty((0, 5)))
+        self.assertEqual(tracker.get_outputs(), [])
+
+    def test_lost_output_is_suppressed_when_prediction_leaves_frame(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'image_width': 100,
+            'image_height': 100,
+            'min_box_area': 1,
+            'output_lost_tracks': True,
+        })
+        tracker.update(np.array([[10.0, 10.0, 30.0, 30.0, 0.9]]))
+        tracker.update(np.empty((0, 5)))
+        track = tracker.tracks[0]
+        # Force this missed-frame prediction partly outside the left image edge.
+        track.history.predict[track.current_frame].bbox = BBOX([5.0, 50.0, 20.0, 20.0])
+        self.assertEqual(tracker.get_outputs(), [])
+
+        tracker.config.lost_output_require_inside_frame = False
+        self.assertEqual(len(tracker.get_outputs()), 1)
+
     def test_q_scale_multiplies_the_complete_process_matrix(self):
         class FakeKalman:
             def __init__(self):
@@ -168,6 +218,17 @@ class ParallelSequenceContractTest(unittest.TestCase):
         self.assertEqual(
             command[seqs_index + 1:seqs_index + 3],
             args.seqs,
+        )
+
+    def test_detection_file_path_includes_detector_name(self):
+        args = SimpleNamespace(
+            detections_dir='C:/Projects/.Detections',
+            detector_name='YOLO26x',
+            dataset='MOT20',
+        )
+        self.assertEqual(
+            run_tracker.detection_file_path(args, 'MOT20-01'),
+            os.path.join('C:/Projects/.Detections', 'YOLO26x', 'MOT20', 'MOT20-01.txt'),
         )
 
     def test_shared_motion_engine_serializes_inference(self):

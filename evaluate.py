@@ -62,7 +62,8 @@ def _write_per_seq_comparison(metrics, trackers, seqs, path):
 @count_time
 def evaluate(dataset, split, trackers_to_eval=None, datasets_dir=None):
     if trackers_to_eval is None:
-        trackers_to_eval = ['ocsort-self', 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt']
+        trackers_to_eval = ['ocsort-self', 'oc-sort']
+        # trackers_to_eval = ['ocsort-self', 'ocsort-self-v', 'oc-sort', 'ocsort-self-transformer', 'ocsort-self-wbrt']
     if datasets_dir is None:
         datasets_dir = DATASETS_DIR
 
@@ -182,6 +183,6 @@ def evaluate(dataset, split, trackers_to_eval=None, datasets_dir=None):
         file.close()
 
 if __name__ == '__main__':
-    # evaluate('MOT20', 'val')
+    evaluate('MOT20', 'val')
     # evaluate('MOT17', 'val')
-    evaluate('DanceTrack', 'val')
+    # evaluate('DanceTrack', 'val')

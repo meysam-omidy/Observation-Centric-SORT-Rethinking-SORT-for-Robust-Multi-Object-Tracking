@@ -33,6 +33,14 @@ class OCSORTTrackerConfig(BaseModel):
     use_learned_q : bool = True   # False -> ignore the model's var_q, keep the KF's fixed Q
     q_scale : float = Field(default=1.0, gt=0)
     r_scale : float = Field(default=1.0, gt=0)
+    # Opt-in online extrapolation output for short confirmed-track occlusions.
+    # This changes only what is written to MOT output; association/lifecycle stay
+    # unchanged and tracks still obey max_age.
+    output_lost_tracks : bool = False
+    lost_output_max_age : int = Field(default=3, ge=1)
+    lost_output_score_decay : float = Field(default=0.7, gt=0, le=1)
+    lost_output_min_score : float = Field(default=0.1, ge=0, le=1)
+    lost_output_require_inside_frame : bool = True
     log_path : str = None
     reupdate_type : Literal['constant', 'relative', None] = None
     reupdate_constant_weight : float = 1
@@ -343,12 +351,39 @@ class OCSORTTracker:
         outputs = []
         for track in self.tracks:
             s, a = track.bbox.to_xysa()[2:]
-            if all([
-                track.state in [StateTracking],
-                s >= self.config.min_box_area,
-                a <= self.config.max_aspect_ratio
-            ]):
-                outputs.append(track.mot_format.format(frame_number=int(self.frame_number)))
+            is_current_detection = track.current_frame in track.history.update
+            if track.state == StateTracking and (
+                is_current_detection or not self.config.output_lost_tracks
+            ):
+                # With the feature disabled, normal output remains byte-for-byte
+                # equivalent to the old path (including the first missed frame).
+                output = track.mot_format
+            elif (
+                self.config.output_lost_tracks
+                and track.state in [StateTracking, StateLost]
+                and not is_current_detection
+                and 1 <= track.age <= self.config.lost_output_max_age
+            ):
+                # track.bbox is this frame's KF/CV prediction. Decay the last real
+                # detection confidence each missed frame, and stop once it becomes
+                # too weak to be a credible online output.
+                predicted_score = track.score * (
+                    self.config.lost_output_score_decay ** track.age
+                )
+                if predicted_score < self.config.lost_output_min_score:
+                    continue
+                if self.config.lost_output_require_inside_frame:
+                    x1, y1, x2, y2 = track.bbox.to_tlbr()
+                    if x1 < 0 or y1 < 0 or x2 > self.config.image_width or y2 > self.config.image_height:
+                        # A partial out-of-frame prediction likely represents an
+                        # exit, not an occlusion. Do not emit a ghost detection.
+                        continue
+                output = track.mot_format_for(track.bbox, predicted_score)
+            else:
+                continue
+
+            if s >= self.config.min_box_area and a <= self.config.max_aspect_ratio:
+                outputs.append(output)
         return outputs
     
     def associate(self, tracks : list[Track], detections : np.ndarray, scores : np.ndarray, iou_threshold : float, phase : int):
