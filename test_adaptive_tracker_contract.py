@@ -61,6 +61,7 @@ class AdaptiveTrackerContractTest(unittest.TestCase):
     def test_noise_scale_defaults_and_validation(self):
         self.assertEqual(OCSORTTrackerConfig().q_scale, 1.0)
         self.assertEqual(OCSORTTrackerConfig().r_scale, 1.0)
+        self.assertIsNone(OCSORTTrackerConfig(log_path=None).log_path)
         self.assertEqual(TrackConfig().q_scale, 1.0)
         self.assertEqual(TrackConfig().r_scale, 1.0)
         with self.assertRaises(ValidationError):
@@ -78,6 +79,100 @@ class AdaptiveTrackerContractTest(unittest.TestCase):
         self.assertEqual(len(tracker.tracks), 1)
         self.assertEqual(tracker.tracks[0].config.q_scale, 0.25)
         self.assertEqual(tracker.tracks[0].config.r_scale, 0.05)
+
+    def test_no_motion_engine_bypasses_history_feature_window(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'update_window_start': 2,
+            'update_window_end': 2,
+        })
+        detections = np.array([[10.0, 10.0, 30.0, 30.0, 0.9]])
+        tracker.update(detections)
+        tracker.update(detections)
+
+        # Before the fast path, the next update would enter the legacy-model
+        # batching branch and call compute_motion_features despite no engine.
+        with patch('ocsort.compute_motion_features', side_effect=AssertionError):
+            tracker.update(detections)
+
+        self.assertEqual(len(tracker.tracks), 1)
+
+    def test_mahalanobis_gate_rejects_an_implausible_overlapping_detection(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'use_confidence_r': True,
+            'use_mahalanobis_gate': True,
+            'mahalanobis_gate_threshold': 5.0,
+        })
+        tracker.update(np.array([[10.0, 10.0, 30.0, 30.0, 0.9]]))
+        track = tracker.tracks[0]
+
+        # This box still passes the normal 0.2 IoU gate, but its 10.5-pixel
+        # innovation is too large for the track's tight confidence covariance.
+        matches, unmatched_tracks, unmatched_detections = tracker.associate(
+            [track],
+            np.array([
+                [10.5, 10.0, 30.5, 30.0],  # covariance-valid candidate
+                [20.5, 10.0, 40.5, 30.0],  # overlaps, but outside the gate
+            ]),
+            np.array([0.9, 0.9]),
+            iou_threshold=0.2,
+            phase=1,
+        )
+        self.assertEqual(matches, [[0, 0]])
+        self.assertEqual(unmatched_tracks, [])
+        self.assertEqual(unmatched_detections, [1])
+
+    def test_mahalanobis_cost_does_not_enable_the_hard_gate(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'use_confidence_r': True,
+            'use_mahalanobis_cost': True,
+            'mahalanobis_cost_coefficient': 0.05,
+            'mahalanobis_gate_threshold': 5.0,
+        })
+        tracker.update(np.array([[10.0, 10.0, 30.0, 30.0, 0.9]]))
+        track = tracker.tracks[0]
+
+        # The candidate is outside the configured gate, but cost-only mode must
+        # leave it eligible for its otherwise-valid IoU association.
+        matches, unmatched_tracks, unmatched_detections = tracker.associate(
+            [track],
+            np.array([[20.5, 10.0, 40.5, 30.0]]),
+            np.array([0.9]),
+            iou_threshold=0.2,
+            phase=1,
+        )
+        self.assertEqual(matches, [[0, 0]])
+        self.assertEqual(unmatched_tracks, [])
+        self.assertEqual(unmatched_detections, [])
+
+    def test_mahalanobis_cost_falls_back_when_distance_is_non_finite(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'use_mahalanobis_cost': True,
+            'mahalanobis_cost_coefficient': 0.02,
+        })
+        tracker.update(np.array([[10.0, 10.0, 30.0, 30.0, 0.9]]))
+        track = tracker.tracks[0]
+
+        # An unavailable covariance score must not reject an otherwise-valid
+        # IoU candidate when hard gating was not requested.
+        with patch.object(
+            tracker,
+            '_mahalanobis_distances',
+            return_value=np.array([[np.inf]]),
+        ):
+            matches, unmatched_tracks, unmatched_detections = tracker.associate(
+                [track],
+                np.array([[10.5, 10.0, 30.5, 30.0]]),
+                np.array([0.9]),
+                iou_threshold=0.2,
+                phase=1,
+            )
+        self.assertEqual(matches, [[0, 0]])
+        self.assertEqual(unmatched_tracks, [])
+        self.assertEqual(unmatched_detections, [])
 
     def test_lost_track_output_is_opt_in_and_decays_prediction_score(self):
         base_config = {
@@ -230,6 +325,32 @@ class ParallelSequenceContractTest(unittest.TestCase):
             run_tracker.detection_file_path(args, 'MOT20-01'),
             os.path.join('C:/Projects/.Detections', 'YOLO26x', 'MOT20', 'MOT20-01.txt'),
         )
+
+    def test_sequence_log_path_supports_directory_file_and_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_args = SimpleNamespace(
+                log_path=os.path.join(directory, 'logs'), seqs=['seq-a', 'seq-b']
+            )
+            self.assertEqual(
+                run_tracker.sequence_log_path(directory_args, 'seq-a'),
+                os.path.join(directory, 'logs', 'seq-a.assoc.log'),
+            )
+
+            file_args = SimpleNamespace(
+                log_path=os.path.join(directory, 'association.log'), seqs=['seq-a', 'seq-b']
+            )
+            self.assertEqual(
+                run_tracker.sequence_log_path(file_args, 'seq-b'),
+                os.path.join(directory, 'association-seq-b.log'),
+            )
+
+            template_args = SimpleNamespace(
+                log_path=os.path.join(directory, '{seq}.log'), seqs=['seq-a', 'seq-b']
+            )
+            self.assertEqual(
+                run_tracker.sequence_log_path(template_args, 'seq-b'),
+                os.path.join(directory, 'seq-b.log'),
+            )
 
     def test_shared_motion_engine_serializes_inference(self):
         class FakeEngine:

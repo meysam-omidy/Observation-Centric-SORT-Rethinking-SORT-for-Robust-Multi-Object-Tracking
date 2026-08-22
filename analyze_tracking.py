@@ -18,10 +18,13 @@ Usage (defaults = the current 'new implementation': adaptive_kalman real model):
 """
 from __future__ import annotations
 import argparse, configparser, json, os, pickle
+from collections import Counter
 import numpy as np
+import lap
 
 from ocsort import OCSORTTracker
 from track_state import StateTracking, StateLost, StateDeleted, StateUnconfirmed
+from utils import batch_iou
 
 
 # ----------------------------- geometry -----------------------------
@@ -70,6 +73,11 @@ def build_config(args, iw, ih):
         "match_remained_high_score_dets_with_unconfirmed_trks_threshold": args.match_remained_high_score_dets_with_unconfirmed_trks_threshold,
         "association_iou_coefficient": args.association_iou_coefficient,
         "association_speed_direction_coefficient": args.association_speed_direction_coefficient,
+        "use_mahalanobis_association": args.use_mahalanobis_association,
+        "use_mahalanobis_cost": args.use_mahalanobis_cost,
+        "use_mahalanobis_gate": args.use_mahalanobis_gate,
+        "mahalanobis_cost_coefficient": args.mahalanobis_cost_coefficient,
+        "mahalanobis_gate_threshold": args.mahalanobis_gate_threshold,
         "use_byte": args.use_byte, "use_oru": args.use_oru,
         "use_confidence_r": args.use_confidence_r,
         "use_learned_q": args.use_learned_q,
@@ -79,6 +87,7 @@ def build_config(args, iw, ih):
         "lost_output_score_decay": args.lost_output_score_decay,
         "lost_output_min_score": args.lost_output_min_score,
         "lost_output_require_inside_frame": args.lost_output_require_inside_frame,
+        "collect_association_diagnostics": args.association_attribution,
         "reupdate_type": args.reupdate_type,
         "reupdate_constant_weight": args.reupdate_constant_weight,
         "log_path": None,  # set per-seq
@@ -106,7 +115,7 @@ def detection_file_path(args, seq):
     return os.path.join(*parts)
 
 
-def run_and_capture(args, seq, out_dir):
+def run_and_capture(args, seq, out_dir, gt_by_frame=None):
     seq_dir = f"{args.datasets_dir}/{args.dataset}/{args.split}/{seq}"
     cfg = configparser.ConfigParser(); cfg.read(f"{seq_dir}/seqinfo.ini")
     iw, ih = cfg["Sequence"]["imWidth"], cfg["Sequence"]["imHeight"]
@@ -118,11 +127,23 @@ def run_and_capture(args, seq, out_dir):
 
     det_path = detection_file_path(args, seq)
     dets = np.loadtxt(det_path, delimiter=",")
+    attribution = (
+        AssociationAttribution(args.match_iou)
+        if args.association_attribution else None
+    )
 
     outputs_by_frame = {}   # frame -> [(tid, tlbr, score)]
     for fr in range(1, seqlen + 1):
         frame_dets = dets[dets[:, 0] == fr][:, 1:]
         tracker.update(frame_dets)
+        if attribution is not None:
+            attribution.consume_frame(
+                fr,
+                (gt_by_frame or {}).get(fr, []),
+                frame_dets,
+                tracker.last_association_diagnostics,
+                tracker,
+            )
         rows = []
         for line in tracker.get_outputs():
             p = line.split(",")
@@ -132,9 +153,10 @@ def run_and_capture(args, seq, out_dir):
         outputs_by_frame[fr] = rows
 
     tracker.motion_engine = None  # drop the torch model so the pickle is small/portable
+    tracker.last_association_diagnostics = []
     with open(os.path.join(out_dir, f"{seq}.tracker.pkl"), "wb") as f:
         pickle.dump(tracker, f)
-    return tracker, outputs_by_frame, seqlen
+    return tracker, outputs_by_frame, seqlen, attribution
 
 
 # ----------------------------- analyze -----------------------------
@@ -155,6 +177,406 @@ def greedy_match(gts, outs, thr):
     return m
 
 
+# ----------------------------- association attribution -----------------------------
+def oracle_gt_detection_matches(gts, detections, threshold):
+    """Return one-to-one GT/detection indices for a frame using Hungarian IoU."""
+    if not gts or len(detections) == 0:
+        return {}, {}
+    gt_boxes = np.stack([box for _, box in gts]).astype(float, copy=False)
+    det_boxes = np.asarray(detections, dtype=float).reshape(-1, 5)[:, :4]
+    ious = batch_iou(gt_boxes, det_boxes)
+    _, gt_to_det_indices, _ = lap.lapjv(1.0 - ious, extend_cost=True)
+    gt_to_det, det_to_gt = {}, {}
+    for gt_index, detection_index in enumerate(gt_to_det_indices):
+        if detection_index < 0 or ious[gt_index, detection_index] < threshold:
+            continue
+        gt_id = int(gts[gt_index][0])
+        detection_index = int(detection_index)
+        gt_to_det[gt_id] = detection_index
+        det_to_gt[detection_index] = gt_id
+    return gt_to_det, det_to_gt
+
+
+class AssociationAttribution:
+    """Causally label real tracker association outcomes against oracle GT/dets.
+
+    ``track_to_gt`` is updated only after each production association. Ground
+    truth never changes tracking; it only lets us ask whether the track that
+    represented GT identity g before the frame received g's oracle detection.
+    """
+
+    def __init__(self, match_iou):
+        self.match_iou = float(match_iou)
+        self.track_to_gt: dict[int, int] = {}
+        self.counts = Counter()
+        self.global_conflict_counts = Counter()
+        self.failures: list[dict] = []
+        self._by_frame_track: dict[tuple[int, int, int], dict] = {}
+        self.frames = 0
+
+    @staticmethod
+    def _as_index(value):
+        return None if value is None else int(value) + 1
+
+    @staticmethod
+    def _compact_number(value):
+        return None if value is None or not np.isfinite(value) else round(float(value), 6)
+
+    def _record(self, record):
+        label = record["label"]
+        self.counts[label] += 1
+        if label == "GLOBAL_DISPLACEMENT" and record.get("conflict"):
+            self.global_conflict_counts[record["conflict"]["type"]] += 1
+        self._by_frame_track[
+            (record["frame"], record["track_id"], record["source_gt_id"])
+        ] = record
+        if label != "CORRECT_ASSOCIATION":
+            self.failures.append(record)
+
+    def _pair_cost(self, event, row, detection_index):
+        """Return the exact row/column score if that detection was offered."""
+        if detection_index is None:
+            return None
+        cols = np.flatnonzero(event["detection_indices"] == detection_index)
+        if not len(cols):
+            return {
+                "detection_index": self._as_index(detection_index),
+                "offered": False,
+                "valid": False,
+                "cost": None,
+            }
+        col = int(cols[0])
+        return {
+            "detection_index": self._as_index(detection_index),
+            "offered": True,
+            "valid": bool(event["valid_pairs"][row, col]),
+            "cost": self._compact_number(event["cost"][row, col]),
+        }
+
+    def _global_conflict(
+        self,
+        event,
+        source_track_id,
+        source_gt_id,
+        expected_detection_a,
+        assigned_detection,
+        expected_owner_track_id,
+        previous_track_to_gt,
+        gt_to_det,
+    ):
+        """Describe the counterpart that won A's locally best detection."""
+        if expected_owner_track_id is None:
+            return {
+                "type": "UNRESOLVED_OWNER",
+                "reason": "No matched owner was found for A's expected detection.",
+            }
+        owner_rows = np.flatnonzero(
+            np.asarray(event["track_ids"], dtype=int) == expected_owner_track_id
+        )
+        if not len(owner_rows):
+            return {
+                "type": "UNRESOLVED_OWNER",
+                "reason": "Expected-detection owner is absent from the phase matrix.",
+                "track_b_id": int(expected_owner_track_id),
+            }
+        owner_row = int(owner_rows[0])
+        source_gt_b = previous_track_to_gt.get(expected_owner_track_id)
+        expected_detection_b = (
+            None if source_gt_b is None else gt_to_det.get(source_gt_b)
+        )
+        assigned_b = assigned_detection.get(expected_owner_track_id)
+        assigned_detection_b = None if assigned_b is None else assigned_b[0]
+
+        if source_gt_b is None:
+            conflict_type = "WINNER_SOURCE_UNMAPPED"
+            reason = "The winning track had no causal GT identity before this frame."
+        elif source_gt_b == source_gt_id:
+            conflict_type = "DUPLICATE_TRACK_CONFLICT"
+            reason = "Both tracks represented the same GT identity before this frame."
+        elif expected_detection_b is None:
+            conflict_type = "WINNER_GT_DETECTION_MISSING"
+            reason = "The winning track's own GT had no oracle detector match."
+        elif (
+            assigned_detection_b == expected_detection_a
+            and assigned_detection.get(source_track_id, (None,))[0] == expected_detection_b
+        ):
+            conflict_type = "TWO_WAY_SWAP"
+            reason = "The two tracks exchanged their oracle expected detections."
+        elif assigned_detection_b == expected_detection_a:
+            conflict_type = "ONE_WAY_THEFT"
+            reason = "The winning track took A's expected detection without a direct swap."
+        else:
+            conflict_type = "COMPLEX_MULTITRACK_CONFLICT"
+            reason = "The expected detection changed owners through a larger assignment conflict."
+
+        source_rows = np.flatnonzero(
+            np.asarray(event["track_ids"], dtype=int) == source_track_id
+        )
+        source_row = int(source_rows[0]) if len(source_rows) else None
+        return {
+            "type": conflict_type,
+            "reason": reason,
+            "track_a": {
+                "track_id": int(source_track_id),
+                "source_gt_id": int(source_gt_id),
+                "expected_detection_index": self._as_index(expected_detection_a),
+                "assigned_detection_index": self._as_index(
+                    assigned_detection.get(source_track_id, (None,))[0]
+                ),
+            },
+            "track_b": {
+                "track_id": int(expected_owner_track_id),
+                "source_gt_id": source_gt_b,
+                "expected_detection_index": self._as_index(expected_detection_b),
+                "assigned_detection_index": self._as_index(assigned_detection_b),
+            },
+            "costs": {
+                "a_to_expected_a": self._pair_cost(
+                    event, source_row, expected_detection_a
+                ) if source_row is not None else None,
+                "a_to_expected_b": self._pair_cost(
+                    event, source_row, expected_detection_b
+                ) if source_row is not None else None,
+                "b_to_expected_a": self._pair_cost(
+                    event, owner_row, expected_detection_a
+                ),
+                "b_to_expected_b": self._pair_cost(
+                    event, owner_row, expected_detection_b
+                ),
+            },
+        }
+
+    def consume_frame(self, frame, gt_items, detections, events, tracker):
+        """Consume current-frame tracker diagnostics after ``tracker.update``."""
+        self.frames += 1
+        detections = np.asarray(detections, dtype=float).reshape(-1, 5)
+        gt_to_det, det_to_gt = oracle_gt_detection_matches(
+            gt_items, detections, self.match_iou
+        )
+        previous_track_to_gt = dict(self.track_to_gt)
+
+        # Actual per-track assignments after all phases. A confirmed track
+        # appears in phase 1 and, only if unmatched there, may appear in phase
+        # 2. The last stored assignment is therefore its final one.
+        assigned_detection: dict[int, tuple[int, int]] = {}
+        events_by_track: dict[int, list[tuple[dict, int]]] = {}
+        for event in events:
+            track_ids = event["track_ids"]
+            for row, track_id in enumerate(track_ids):
+                events_by_track.setdefault(track_id, []).append((event, row))
+            for row, col in event["matches"]:
+                track_id = track_ids[row]
+                assigned_detection[track_id] = (
+                    int(event["detection_indices"][col]), int(event["phase"])
+                )
+
+        for track_id, source_gt_id in previous_track_to_gt.items():
+            expected_detection = gt_to_det.get(source_gt_id)
+            actual = assigned_detection.get(track_id)
+            actual_detection = None if actual is None else actual[0]
+            actual_phase = None if actual is None else actual[1]
+            source_events = events_by_track.get(track_id, [])
+
+            # A deleted track retains its causal identity through a GT/detector
+            # miss gap. Once its GT has a usable detector match again, report one
+            # lifecycle failure rather than losing the eventual BIRTH/REVIVE
+            # switch context altogether.
+            if not source_events and expected_detection is None:
+                continue
+            record = {
+                "frame": int(frame),
+                "track_id": int(track_id),
+                "source_gt_id": int(source_gt_id),
+                "expected_detection_index": self._as_index(expected_detection),
+                "assigned_detection_index": self._as_index(actual_detection),
+                "assigned_gt_id": (
+                    None if actual_detection is None else det_to_gt.get(actual_detection)
+                ),
+                "assigned_phase": actual_phase,
+                "label": None,
+                "reason": None,
+            }
+
+            if expected_detection is None:
+                record.update(
+                    label="GT_DETECTION_MISSING",
+                    reason="No one-to-one detector match for the source GT at this frame.",
+                )
+                self._record(record)
+                continue
+
+            if not source_events:
+                record.update(
+                    label="TRACK_NOT_ACTIVE",
+                    reason="Source track was no longer active when its GT detection returned.",
+                )
+                self._record(record)
+                # Do not report the same deleted track on every later frame.
+                self.track_to_gt.pop(track_id, None)
+                continue
+
+            expected_event = None
+            expected_row = expected_col = None
+            offered_phases = []
+            for event, row in source_events:
+                offered_phases.append(int(event["phase"]))
+                cols = np.flatnonzero(event["detection_indices"] == expected_detection)
+                if len(cols):
+                    expected_event, expected_row, expected_col = event, row, int(cols[0])
+                    break
+
+            if actual_detection == expected_detection:
+                record.update(
+                    label="CORRECT_ASSOCIATION",
+                    reason="The source track received its oracle GT detection.",
+                )
+                self._record(record)
+                continue
+
+            if expected_event is None:
+                if offered_phases:
+                    reason = (
+                        "Expected detection was not offered in phases "
+                        f"{sorted(set(offered_phases))}; score/phase priority or an "
+                        "earlier match prevented this candidate."
+                    )
+                    label = "CANDIDATE_REJECTED"
+                else:
+                    reason = "Source track was not active in any association phase."
+                    label = "TRACK_NOT_ACTIVE"
+                record.update(label=label, reason=reason, offered_phases=sorted(set(offered_phases)))
+                self._record(record)
+                continue
+
+            valid_pairs = expected_event["valid_pairs"]
+            costs = expected_event["cost"]
+            ious = expected_event["iou"]
+            direction_cost = expected_event["direction_cost"]
+            record.update(
+                phase=int(expected_event["phase"]),
+                expected_iou=self._compact_number(ious[expected_row, expected_col]),
+                expected_direction_cost=self._compact_number(
+                    direction_cost[expected_row, expected_col]
+                ),
+                expected_cost=self._compact_number(costs[expected_row, expected_col]),
+            )
+            if not valid_pairs[expected_row, expected_col]:
+                record.update(
+                    label="CANDIDATE_REJECTED",
+                    reason="Expected detection failed the phase's valid-pair gate.",
+                )
+                self._record(record)
+                continue
+
+            row_valid = valid_pairs[expected_row]
+            row_costs = costs[expected_row]
+            best_col = int(np.argmin(np.where(row_valid, row_costs, np.inf)))
+            expected_cost = float(row_costs[expected_col])
+            local_rank = int(np.sum(row_valid & (row_costs < expected_cost - 1e-12))) + 1
+            expected_owner = None
+            for owner_row, owner_col in expected_event["matches"]:
+                if owner_col == expected_col:
+                    expected_owner = int(expected_event["track_ids"][owner_row])
+                    break
+            record.update(
+                local_rank=local_rank,
+                row_best_detection_index=self._as_index(
+                    int(expected_event["detection_indices"][best_col])
+                ),
+                row_best_cost=self._compact_number(row_costs[best_col]),
+                expected_detection_owner_track_id=expected_owner,
+            )
+            if local_rank > 1:
+                record.update(
+                    label="LOCAL_RANKING_FAILURE",
+                    reason="A different valid detection had lower local association cost.",
+                )
+            else:
+                record.update(
+                    label="GLOBAL_DISPLACEMENT",
+                    reason=(
+                        "Expected detection was locally best but was assigned to another "
+                        "track or displaced by global assignment."
+                    ),
+                )
+                record["conflict"] = self._global_conflict(
+                    expected_event,
+                    track_id,
+                    source_gt_id,
+                    expected_detection,
+                    assigned_detection,
+                    expected_owner,
+                    previous_track_to_gt,
+                    gt_to_det,
+                )
+            self._record(record)
+
+        # Association updates are the only causal source of a track's identity
+        # mapping. Unmatched tracks retain their last identity through gaps.
+        for track_id, (detection_index, _) in assigned_detection.items():
+            gt_id = det_to_gt.get(detection_index)
+            if gt_id is not None:
+                self.track_to_gt[track_id] = gt_id
+
+        # First-frame / post-phase-3 births have no existing source identity.
+        # Attach them after the tracker has initialized them so their next frame
+        # can be attributed causally.
+        used_detection_indices = set(assigned_detection.values())
+        used_detection_indices = {item[0] for item in used_detection_indices}
+        for track in tracker.tracks:
+            if track.id in self.track_to_gt:
+                continue
+            update = track.history.update.get(frame)
+            if update is None:
+                continue
+            box = update.bbox.to_tlbr()
+            candidates = np.flatnonzero(np.all(np.isclose(detections[:, :4], box), axis=1))
+            for detection_index in candidates:
+                if detection_index in used_detection_indices:
+                    continue
+                gt_id = det_to_gt.get(int(detection_index))
+                if gt_id is not None:
+                    self.track_to_gt[track.id] = gt_id
+                    used_detection_indices.add(int(detection_index))
+                    break
+
+        # Align the next frame's source identity with the same GT/output IoU
+        # convention used by this script's ID-switch analysis. This is still
+        # strictly post-association diagnostic bookkeeping: it never feeds back
+        # into the tracker or the cost matrices captured above.
+        output_rows = []
+        for line in tracker.get_outputs():
+            values = line.split(",")
+            track_id = int(values[1])
+            x, y, w, h, score = map(float, values[2:7])
+            output_rows.append((track_id, tlwh_to_tlbr([x, y, w, h]), score))
+        for gt_id, track_id in greedy_match(gt_items, output_rows, self.match_iou).items():
+            self.track_to_gt[track_id] = gt_id
+
+
+    def switch_record(self, frame, old_track_id, gt_id):
+        return self._by_frame_track.get((int(frame), int(old_track_id), int(gt_id)))
+
+    def summary(self):
+        return {
+            "frames": self.frames,
+            "classified_track_frames": int(sum(self.counts.values())),
+            "label_counts": dict(sorted(self.counts.items())),
+            "global_conflict_type_counts": dict(sorted(self.global_conflict_counts.items())),
+            "failure_count": len(self.failures),
+        }
+
+    def write(self, seq, out_dir):
+        path = os.path.join(out_dir, f"{seq}.association_attribution.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"seq": seq, "summary": self.summary(), "failures": self.failures},
+                handle,
+                indent=2,
+            )
+        return path
+
+
 def track_snapshot(track, fr, gt_tlbr):
     """Per-frame view of a track for the report."""
     pred = track.history.predict.get(fr)
@@ -172,7 +594,10 @@ def track_snapshot(track, fr, gt_tlbr):
     return snap
 
 
-def analyze(seq, tracker, outputs_by_frame, gt_by_frame, seqlen, thr, out_dir, ctx=2):
+def analyze(
+    seq, tracker, outputs_by_frame, gt_by_frame, seqlen, thr, out_dir,
+    ctx=2, attribution=None,
+):
     tracks_by_id = {t.id: t for t in tracker.tracks}
 
     # per-frame GT<->tracker assignment
@@ -232,7 +657,10 @@ def analyze(seq, tracker, outputs_by_frame, gt_by_frame, seqlen, thr, out_dir, c
             cause = "REVIVE (old track went Lost; GT re-attached to another id)"
         else:
             cause = "THEFT (another live track grabbed the detection during crossing)"
-        cases.append({**sw, "cause": cause, "timeline": timeline})
+        case = {**sw, "cause": cause, "timeline": timeline}
+        if attribution is not None:
+            case["association_attribution"] = attribution.switch_record(fr, ot, gid)
+        cases.append(case)
 
     summary = {
         "seq": seq, "frames": seqlen,
@@ -245,6 +673,23 @@ def analyze(seq, tracker, outputs_by_frame, gt_by_frame, seqlen, thr, out_dir, c
     for c in cases:
         key = c["cause"].split(" ")[0]
         summary["cause_counts"][key] = summary["cause_counts"].get(key, 0) + 1
+    if attribution is not None:
+        switch_records = [
+            case["association_attribution"] for case in cases
+            if case.get("association_attribution") is not None
+        ]
+        summary["association_attribution"] = {
+            **attribution.summary(),
+            "switches_with_attribution": len(switch_records),
+            "switch_label_counts": dict(sorted(Counter(
+                record["label"] for record in switch_records
+            ).items())),
+            "switch_global_conflict_type_counts": dict(sorted(Counter(
+                record["conflict"]["type"]
+                for record in switch_records
+                if record["label"] == "GLOBAL_DISPLACEMENT" and record.get("conflict")
+            ).items())),
+        }
 
     with open(os.path.join(out_dir, f"{seq}.analysis.json"), "w") as f:
         json.dump({"summary": summary, "switches": cases}, f, indent=2)
@@ -291,9 +736,17 @@ def main(args):
     all_sum = []
     for seq in seqs:
         print(f"\n### running {seq} ...")
-        tracker, outputs_by_frame, seqlen = run_and_capture(args, seq, out_dir)
         gt_by_frame = load_gt(f"{args.datasets_dir}/{args.dataset}/{args.split}/{seq}", is_mot)
-        s = analyze(seq, tracker, outputs_by_frame, gt_by_frame, seqlen, args.match_iou, out_dir)
+        tracker, outputs_by_frame, seqlen, attribution = run_and_capture(
+            args, seq, out_dir, gt_by_frame
+        )
+        s = analyze(
+            seq, tracker, outputs_by_frame, gt_by_frame, seqlen, args.match_iou,
+            out_dir, attribution=attribution,
+        )
+        if attribution is not None:
+            path = attribution.write(seq, out_dir)
+            print(f"  association attribution: {path}")
         all_sum.append(s)
     print("\n=== ALL SEQUENCES ===")
     for s in all_sum:
@@ -323,6 +776,14 @@ if __name__ == "__main__":
         help="Detector subfolder under --detections_dir (e.g. YOLO11x, YOLO26x, YOLOXx).",
     )
     p.add_argument("--match_iou", type=float, default=0.5)
+    p.add_argument(
+        "--association_attribution", action="store_true", default=False,
+        help=(
+            "capture production association matrices and label each stable-track "
+            "failure as local ranking, global displacement, candidate rejection, "
+            "or missing GT detection"
+        ),
+    )
     # Tracker options: kept in parity with run_tracker.py so an analysis run
     # reproduces the same tracker behaviour.
     p.add_argument("--max_age", type=int, default=30)
@@ -339,6 +800,14 @@ if __name__ == "__main__":
     p.add_argument("--match_remained_high_score_dets_with_unconfirmed_trks_threshold", type=float, default=0.3)
     p.add_argument("--association_iou_coefficient", type=float, default=1.0)
     p.add_argument("--association_speed_direction_coefficient", type=float, default=0.3)
+    p.add_argument("--use_mahalanobis_association", action="store_true", default=False,
+                   help="legacy alias: enable both Mahalanobis soft cost and hard gate")
+    p.add_argument("--use_mahalanobis_cost", action="store_true", default=False,
+                   help="add a soft Mahalanobis cost without rejecting candidates")
+    p.add_argument("--use_mahalanobis_gate", action="store_true", default=False,
+                   help="reject covariance-improbable candidates without adding Mahalanobis cost")
+    p.add_argument("--mahalanobis_cost_coefficient", type=float, default=1.0)
+    p.add_argument("--mahalanobis_gate_threshold", type=float, default=9.4877)
     p.add_argument("--use_byte", action="store_true", default=True)
     p.add_argument("--no_use_byte", action="store_false", dest="use_byte")
     p.add_argument("--use_oru", action="store_true", default=True)

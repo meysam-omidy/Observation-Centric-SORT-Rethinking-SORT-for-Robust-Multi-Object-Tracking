@@ -214,5 +214,7 @@ motion_model_weights
 trackeval
 analysis
 data*
+logs/
+eval/
 *.ipynb
 *.pth

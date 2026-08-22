@@ -17,6 +17,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import threading
+import time
 
 import numpy as np
 import configparser
@@ -24,7 +25,6 @@ import configparser
 from ocsort import OCSORTTracker
 from evaluate import evaluate
 from motion_predictor import MotionPredictorConfig, MotionPredictorEngine
-from utils import count_time
 
 
 def collect_seqs(args) -> list[str]:
@@ -68,7 +68,12 @@ class LockedMotionPredictorEngine:
             return self._engine.predict_batch(*args, **kwargs)
 
 
-def tracker_config(args, image_width: str, image_height: str) -> dict:
+def tracker_config(
+    args,
+    image_width: str,
+    image_height: str,
+    log_path: str | None = None,
+) -> dict:
     return {
         'image_width': image_width,
         'image_height': image_height,
@@ -86,6 +91,11 @@ def tracker_config(args, image_width: str, image_height: str) -> dict:
         'match_remained_high_score_dets_with_unconfirmed_trks_threshold': args.match_remained_high_score_dets_with_unconfirmed_trks_threshold,
         'association_iou_coefficient': args.association_iou_coefficient,
         'association_speed_direction_coefficient': args.association_speed_direction_coefficient,
+        'use_mahalanobis_association': args.use_mahalanobis_association,
+        'use_mahalanobis_cost': args.use_mahalanobis_cost,
+        'use_mahalanobis_gate': args.use_mahalanobis_gate,
+        'mahalanobis_cost_coefficient': args.mahalanobis_cost_coefficient,
+        'mahalanobis_gate_threshold': args.mahalanobis_gate_threshold,
         'use_byte': args.use_byte,
         'use_oru': args.use_oru,
         'use_confidence_r': args.use_confidence_r,
@@ -99,6 +109,7 @@ def tracker_config(args, image_width: str, image_height: str) -> dict:
         'lost_output_require_inside_frame': args.lost_output_require_inside_frame,
         'reupdate_type': args.reupdate_type,
         'reupdate_constant_weight': args.reupdate_constant_weight,
+        'log_path': log_path,
         'motion': motion_config(args),
     }
 
@@ -112,17 +123,47 @@ def detection_file_path(args, seq: str) -> str:
     return os.path.join(*parts)
 
 
-@count_time
+def sequence_log_path(args, seq: str) -> str | None:
+    """Resolve a separate association log for each sequence.
+
+    ``--log_path logs`` writes ``logs/<sequence>.assoc.log``. A path containing
+    ``{seq}`` is treated as a template, while a filename ending in ``.log`` is
+    used directly for a single sequence and receives a ``-<sequence>`` suffix
+    for a multi-sequence run.
+    """
+    requested_path = args.log_path
+    if not requested_path:
+        return None
+
+    if '{seq}' in requested_path:
+        path = requested_path.replace('{seq}', seq)
+    elif os.path.splitext(requested_path)[1].lower() == '.log':
+        seqs = args.seqs or []
+        if len(set(seqs)) <= 1:
+            path = requested_path
+        else:
+            root, extension = os.path.splitext(requested_path)
+            path = f'{root}-{seq}{extension}'
+    else:
+        path = os.path.join(requested_path, f'{seq}.assoc.log')
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    return path
+
+
 def run(seq: str, args, motion_engine=None) -> None:
     print(f'[{seq}] starting')
+    started = time.perf_counter()
     detections = np.loadtxt(detection_file_path(args, seq), delimiter=',')
     config = configparser.ConfigParser()
     config.read(f'{args.datasets_dir}/{args.dataset}/{args.split}/{seq}/seqinfo.ini')
+    frame_count = int(config['Sequence']['seqLength'])
     tracker = OCSORTTracker(
         tracker_config(
             args,
             config['Sequence']['imWidth'],
             config['Sequence']['imHeight'],
+            log_path=sequence_log_path(args, seq),
         ),
         motion_engine=motion_engine,
     )
@@ -131,7 +172,7 @@ def run(seq: str, args, motion_engine=None) -> None:
     temporary_path = f'{output_path}.tmp-{os.getpid()}-{threading.get_ident()}'
     try:
         with open(temporary_path, 'w') as file:
-            for frame_number in range(1, int(config['Sequence']['seqLength']) + 1):
+            for frame_number in range(1, frame_count + 1):
                 dets = detections[detections[:, 0] == frame_number][:, 1:]
                 tracker.update(dets)
                 for output in tracker.get_outputs():
@@ -140,7 +181,9 @@ def run(seq: str, args, motion_engine=None) -> None:
     finally:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
-    print(f'[{seq}] completed')
+    elapsed = time.perf_counter() - started
+    fps = frame_count / elapsed if elapsed > 0 else float('inf')
+    print(f'[{seq}] completed in {elapsed:.2f}s ({fps:.1f} FPS)')
 
 
 def build_shared_motion_engine(args, workers: int):
@@ -189,7 +232,7 @@ def main(args) -> None:
         print('evaluating...')
         evaluate(
             args.dataset, args.split,
-            trackers_to_eval=[args.tracker_name, 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt'],
+            trackers_to_eval=[args.tracker_name, 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt', 'official-ocsort-yoloxx'],
             datasets_dir=args.datasets_dir,
         )
 
@@ -203,9 +246,16 @@ if __name__ == '__main__':
     p.add_argument('--datasets_dir', type=str, default='C:/Projects/.Datasets')
     p.add_argument('--detections_dir', type=str, default='C:/Projects/.Detections',
                    help='root directory containing detector subfolders')
-    p.add_argument('--detector_name', type=str, default='YOLOX',
-                   help='detector subfolder under --detections_dir, e.g. YOLO11x, YOLO26x, YOLOX')
+    p.add_argument('--detector_name', type=str, default='YOLOXx',
+                   help='detector subfolder under --detections_dir, e.g. YOLO11x, YOLO26x, YOLOXx')
     p.add_argument('--tracker_name', type=str, default='ocsort-self', help='output subfolder under outputs/')
+    p.add_argument(
+        '--log_path', type=str, default=None,
+        help=(
+            'association-log directory, .log file, or path template containing {seq}; '
+            'multi-sequence runs always receive separate logs'
+        ),
+    )
     p.add_argument('--evaluate', action='store_true', help='run trackeval (HOTA/CLEAR/Identity) after tracking')
     p.add_argument(
         '--sequence_workers', type=int, default=1,
@@ -226,6 +276,16 @@ if __name__ == '__main__':
     p.add_argument('--match_remained_high_score_dets_with_unconfirmed_trks_threshold', type=float, default=0.3)
     p.add_argument('--association_iou_coefficient', type=float, default=1.0)
     p.add_argument('--association_speed_direction_coefficient', type=float, default=0.3)
+    p.add_argument('--use_mahalanobis_association', action='store_true', default=False,
+                   help='legacy alias: enable both Mahalanobis soft cost and hard gate')
+    p.add_argument('--use_mahalanobis_cost', action='store_true', default=False,
+                   help='add a soft KF innovation-distance cost without rejecting candidates')
+    p.add_argument('--use_mahalanobis_gate', action='store_true', default=False,
+                   help='reject covariance-improbable candidates without adding Mahalanobis cost')
+    p.add_argument('--mahalanobis_cost_coefficient', type=float, default=1.0,
+                   help='weight of squared Mahalanobis distance normalized by the fixed 4-D 95%% reference')
+    p.add_argument('--mahalanobis_gate_threshold', type=float, default=9.4877,
+                   help='maximum squared Mahalanobis distance when --use_mahalanobis_gate is enabled')
     p.add_argument('--use_byte', action='store_true', default=True)
     p.add_argument('--no_use_byte', action='store_false', dest='use_byte')
     p.add_argument('--use_oru', action='store_true', default=True,
@@ -289,4 +349,6 @@ if __name__ == '__main__':
         p.error('--sequence_workers must be at least 1')
     if args.reupdate_type == 'none':
         args.reupdate_type = None
+    if args.log_path == 'none':
+        args.log_path = None
     main(args)
