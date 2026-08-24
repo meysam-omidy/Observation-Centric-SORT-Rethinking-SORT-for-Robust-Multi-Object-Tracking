@@ -73,6 +73,7 @@ def build_config(args, iw, ih):
         "match_remained_high_score_dets_with_unconfirmed_trks_threshold": args.match_remained_high_score_dets_with_unconfirmed_trks_threshold,
         "association_iou_coefficient": args.association_iou_coefficient,
         "association_speed_direction_coefficient": args.association_speed_direction_coefficient,
+        "legacy_post_assignment_iou_gate": args.legacy_post_assignment_iou_gate,
         "use_mahalanobis_association": args.use_mahalanobis_association,
         "use_mahalanobis_cost": args.use_mahalanobis_cost,
         "use_mahalanobis_gate": args.use_mahalanobis_gate,
@@ -968,6 +969,8 @@ if __name__ == "__main__":
     p.add_argument("--match_remained_high_score_dets_with_unconfirmed_trks_threshold", type=float, default=0.3)
     p.add_argument("--association_iou_coefficient", type=float, default=1.0)
     p.add_argument("--association_speed_direction_coefficient", type=float, default=0.3)
+    p.add_argument("--legacy_post_assignment_iou_gate", action="store_true", default=False,
+                   help="compatibility mode: assign first, then remove IoU-invalid pairs")
     p.add_argument("--use_mahalanobis_association", action="store_true", default=False,
                    help="legacy alias: enable both Mahalanobis soft cost and hard gate")
     p.add_argument("--use_mahalanobis_cost", action="store_true", default=False,

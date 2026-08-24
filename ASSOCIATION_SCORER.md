@@ -41,6 +41,11 @@ For example, append `--use_confidence_r` if that is the baseline, or
 how many positive pairs were not offered or were blocked by the existing gate;
 the learned scorer cannot repair those cases.
 
+For compatibility with historical OC-SORT result files, append
+`--legacy_post_assignment_iou_gate` to both export and tracking. This uses the
+old assign-then-filter IoU behavior; it must be consistent between training and
+inference.
+
 ## 2. Train
 
 ```powershell

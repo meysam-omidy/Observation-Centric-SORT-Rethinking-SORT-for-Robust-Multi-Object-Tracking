@@ -26,6 +26,10 @@ class OCSORTTrackerConfig(BaseModel):
     match_remained_high_score_dets_with_unconfirmed_trks_threshold : float = 0.3
     association_iou_coefficient : float = 1
     association_speed_direction_coefficient : float = 0.2
+    # Compatibility mode for results produced before invalid IoU pairs were
+    # masked before Hungarian assignment. It is intentionally opt-in: the
+    # legacy path assigns on the raw matrix and drops invalid matches afterward.
+    legacy_post_assignment_iou_gate : bool = False
     # Optional covariance-aware association. ``use_mahalanobis_association`` is
     # retained as a legacy switch for both behaviours. New experiments should
     # enable the soft cost and hard gate independently.
@@ -945,9 +949,15 @@ class OCSORTTracker:
 
         invalid_pairs = ~iou_valid_pairs
         invalid_pairs |= invalid_mahalanobis_pairs
-        # The assignment must still be solved globally; invalid assignments are
-        # removed below.  A large cost prevents them displacing valid candidates.
-        cost = np.where(invalid_pairs, 1e6, cost)
+        # Historical OC-SORT ran assignment on the raw cost matrix and only
+        # removed IoU-invalid pairs afterward. Keep that exact behaviour behind
+        # an explicit switch so old result files remain reproducible. The
+        # current/default path masks invalid pairs before global assignment.
+        if self.config.legacy_post_assignment_iou_gate:
+            assignment_cost = cost
+        else:
+            assignment_cost = np.where(invalid_pairs, 1e6, cost)
+            cost = assignment_cost
         if association_observer is not None:
             association_observer(
                 phase=phase,
@@ -984,11 +994,10 @@ class OCSORTTracker:
                 seen_detections.add(detection_index)
                 forced_matches.append([track_index, detection_index])
 
-        assignment_cost = cost
         if forced_matches:
             # Preserve the normal global assignment for all remaining rows and
             # columns, while making each requested valid pair unavoidable.
-            assignment_cost = cost.copy()
+            assignment_cost = assignment_cost.copy()
             for track_index, detection_index in forced_matches:
                 assignment_cost[track_index, :] = 1e6
                 assignment_cost[:, detection_index] = 1e6

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from unittest.mock import patch
 
 from association_model import (
     ASSOCIATION_MODEL_VERSION,
@@ -52,6 +53,43 @@ class AssociationModelContractTest(unittest.TestCase):
     def test_learned_association_requires_checkpoint_path(self):
         with self.assertRaisesRegex(ValueError, "association_weights_path"):
             OCSORTTracker({"motion": {"enabled": False}, "use_learned_association": True})
+
+    def test_legacy_iou_gate_keeps_raw_invalid_cost_for_assignment(self):
+        tracker = OCSORTTracker({
+            "motion": {"enabled": False},
+            "legacy_post_assignment_iou_gate": True,
+        })
+        tracker.init_track(np.array([0.0, 0.0, 10.0, 10.0]), 0.9)
+        captured = []
+
+        def capture(cost):
+            captured.append(cost.copy())
+            return [], [0], [0]
+
+        with patch("ocsort.assignment", side_effect=capture):
+            tracker.associate(
+                tracker.tracks,
+                np.array([[100.0, 100.0, 110.0, 110.0]]),
+                np.array([0.9]),
+                iou_threshold=0.2,
+                phase=1,
+            )
+        self.assertEqual(len(captured), 1)
+        self.assertLess(captured[0][0, 0], 1e6)
+
+    def test_default_iou_gate_masks_invalid_cost_before_assignment(self):
+        tracker = OCSORTTracker({"motion": {"enabled": False}})
+        tracker.init_track(np.array([0.0, 0.0, 10.0, 10.0]), 0.9)
+        captured = []
+        with patch("ocsort.assignment", side_effect=lambda cost: (captured.append(cost.copy()) or ([], [0], [0]))):
+            tracker.associate(
+                tracker.tracks,
+                np.array([[100.0, 100.0, 110.0, 110.0]]),
+                np.array([0.9]),
+                iou_threshold=0.2,
+                phase=1,
+            )
+        self.assertEqual(captured[0][0, 0], 1e6)
 
 
 if __name__ == "__main__":

@@ -108,6 +108,7 @@ def tracker_config(args, width: int, height: int) -> dict:
         "match_remained_high_score_dets_with_unconfirmed_trks_threshold": args.match_unconfirmed_threshold,
         "association_iou_coefficient": args.association_iou_coefficient,
         "association_speed_direction_coefficient": args.association_speed_direction_coefficient,
+        "legacy_post_assignment_iou_gate": args.legacy_post_assignment_iou_gate,
         "use_byte": args.use_byte, "use_oru": args.use_oru,
         "use_confidence_r": args.use_confidence_r, "use_learned_q": args.use_learned_q,
         "q_scale": args.q_scale, "r_scale": args.r_scale,
@@ -306,6 +307,8 @@ if __name__ == "__main__":
     parser.add_argument("--match_unconfirmed_threshold", type=float, default=0.3)
     parser.add_argument("--association_iou_coefficient", type=float, default=1.0)
     parser.add_argument("--association_speed_direction_coefficient", type=float, default=0.3)
+    parser.add_argument("--legacy_post_assignment_iou_gate", action="store_true", default=False,
+                        help="match historical post-assignment IoU filtering when exporting candidates")
     parser.add_argument("--use_byte", action="store_true", default=True)
     parser.add_argument("--no_use_byte", action="store_false", dest="use_byte")
     parser.add_argument("--use_oru", action="store_true", default=False)
