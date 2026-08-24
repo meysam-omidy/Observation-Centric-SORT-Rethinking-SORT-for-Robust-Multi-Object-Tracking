@@ -78,6 +78,11 @@ def build_config(args, iw, ih):
         "use_mahalanobis_gate": args.use_mahalanobis_gate,
         "mahalanobis_cost_coefficient": args.mahalanobis_cost_coefficient,
         "mahalanobis_gate_threshold": args.mahalanobis_gate_threshold,
+        "use_learned_association": args.use_learned_association,
+        "association_weights_path": args.association_weights_path,
+        "association_device": args.association_device,
+        "association_cost_weight": args.association_cost_weight,
+        "association_residual_clip": args.association_residual_clip,
         "use_byte": args.use_byte, "use_oru": args.use_oru,
         "use_confidence_r": args.use_confidence_r,
         "use_learned_q": args.use_learned_q,
@@ -87,7 +92,16 @@ def build_config(args, iw, ih):
         "lost_output_score_decay": args.lost_output_score_decay,
         "lost_output_min_score": args.lost_output_min_score,
         "lost_output_require_inside_frame": args.lost_output_require_inside_frame,
-        "collect_association_diagnostics": args.association_attribution,
+        "suppress_duplicate_track_births": args.suppress_duplicate_track_births,
+        "cleanup_duplicate_tracks": args.cleanup_duplicate_tracks,
+        "duplicate_track_iou_threshold": args.duplicate_track_iou_threshold,
+        "duplicate_track_min_observations": args.duplicate_track_min_observations,
+        "duplicate_track_overlap_frames": args.duplicate_track_overlap_frames,
+        "prioritize_mature_tracks": args.prioritize_mature_tracks,
+        "mature_track_min_observations": args.mature_track_min_observations,
+        "collect_association_diagnostics": (
+            args.association_attribution or args.oracle_association
+        ),
         "reupdate_type": args.reupdate_type,
         "reupdate_constant_weight": args.reupdate_constant_weight,
         "log_path": None,  # set per-seq
@@ -129,13 +143,20 @@ def run_and_capture(args, seq, out_dir, gt_by_frame=None):
     dets = np.loadtxt(det_path, delimiter=",")
     attribution = (
         AssociationAttribution(args.match_iou)
-        if args.association_attribution else None
+        if (args.association_attribution or args.oracle_association) else None
     )
+    oracle_policy = OracleAssociationPolicy() if args.oracle_association else None
 
     outputs_by_frame = {}   # frame -> [(tid, tlbr, score)]
+    mot_output_lines = []
     for fr in range(1, seqlen + 1):
         frame_dets = dets[dets[:, 0] == fr][:, 1:]
-        tracker.update(frame_dets)
+        if oracle_policy is not None:
+            gt_to_det, _ = oracle_gt_detection_matches(
+                (gt_by_frame or {}).get(fr, []), frame_dets, args.match_iou
+            )
+            oracle_policy.begin_frame(fr, attribution.track_to_gt, gt_to_det)
+        tracker.update(frame_dets, association_override=oracle_policy)
         if attribution is not None:
             attribution.consume_frame(
                 fr,
@@ -146,6 +167,7 @@ def run_and_capture(args, seq, out_dir, gt_by_frame=None):
             )
         rows = []
         for line in tracker.get_outputs():
+            mot_output_lines.append(line)
             p = line.split(",")
             f_, tid = int(p[0]), int(p[1])
             x, y, w, h, sc = map(float, (p[2], p[3], p[4], p[5], p[6]))
@@ -156,7 +178,7 @@ def run_and_capture(args, seq, out_dir, gt_by_frame=None):
     tracker.last_association_diagnostics = []
     with open(os.path.join(out_dir, f"{seq}.tracker.pkl"), "wb") as f:
         pickle.dump(tracker, f)
-    return tracker, outputs_by_frame, seqlen, attribution
+    return tracker, outputs_by_frame, seqlen, attribution, oracle_policy, mot_output_lines
 
 
 # ----------------------------- analyze -----------------------------
@@ -577,6 +599,104 @@ class AssociationAttribution:
         return path
 
 
+class OracleAssociationPolicy:
+    """GT-only causal association upper-bound policy for offline evaluation.
+
+    The policy receives the production track/detection candidates after normal
+    gates have been applied. It can force only a valid pair whose source track
+    was mapped to the same GT identity on the preceding frame. GT never
+    contributes a box, a prediction, a new track, or an invalid association.
+    """
+
+    def __init__(self):
+        self.frame = None
+        self.previous_track_to_gt = {}
+        self.gt_to_detection = {}
+        self.counts = Counter()
+        self.forced_by_phase = Counter()
+        self._seen_missing_detection = set()
+        self._seen_not_offered = set()
+        self._seen_invalid = set()
+
+    def begin_frame(self, frame, previous_track_to_gt, gt_to_detection):
+        self.frame = int(frame)
+        self.previous_track_to_gt = dict(previous_track_to_gt)
+        self.gt_to_detection = dict(gt_to_detection)
+        self.counts["frames"] += 1
+        self._seen_missing_detection.clear()
+        self._seen_not_offered.clear()
+        self._seen_invalid.clear()
+
+    def __call__(self, *, phase, tracks, detection_indices, valid_pairs, cost):
+        """Return disjoint valid local row/column pairs for this phase."""
+        self.counts["association_calls"] += 1
+        detection_indices = np.asarray(detection_indices, dtype=int)
+        valid_pairs = np.asarray(valid_pairs, dtype=bool)
+        cost = np.asarray(cost, dtype=float)
+        candidates_by_detection = {}
+
+        for row, track in enumerate(tracks):
+            track_id = int(track.id)
+            source_gt_id = self.previous_track_to_gt.get(track_id)
+            if source_gt_id is None:
+                continue
+            expected_detection = self.gt_to_detection.get(source_gt_id)
+            source_key = (track_id, int(source_gt_id))
+            if expected_detection is None:
+                if source_key not in self._seen_missing_detection:
+                    self.counts["source_gt_has_no_detector_match"] += 1
+                    self._seen_missing_detection.add(source_key)
+                continue
+
+            cols = np.flatnonzero(detection_indices == int(expected_detection))
+            if len(cols) == 0:
+                # The expected detector box may be in a different score phase;
+                # count once per track/frame rather than once per callback.
+                if source_key not in self._seen_not_offered:
+                    self.counts["expected_detection_not_offered"] += 1
+                    self._seen_not_offered.add(source_key)
+                continue
+            col = int(cols[0])
+            if not valid_pairs[row, col]:
+                if source_key not in self._seen_invalid:
+                    self.counts["expected_pair_failed_tracker_gate"] += 1
+                    self._seen_invalid.add(source_key)
+                continue
+            self.counts["eligible_valid_pairs"] += 1
+            candidates_by_detection.setdefault(int(expected_detection), []).append(
+                (float(cost[row, col]), track_id, row, col)
+            )
+
+        forced_matches = []
+        for expected_detection, candidates in candidates_by_detection.items():
+            # A prior mapping can contain aliases after an earlier identity
+            # error. Use the lowest production cost, then older ID, rather than
+            # forcing two tracks onto one detector box.
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            _, _, row, col = candidates[0]
+            forced_matches.append((row, col))
+            self.counts["forced_matches"] += 1
+            self.forced_by_phase[int(phase)] += 1
+            if len(candidates) > 1:
+                self.counts["same_gt_track_conflicts"] += len(candidates) - 1
+        return forced_matches
+
+    def summary(self):
+        return {
+            "counts": dict(sorted(self.counts.items())),
+            "forced_by_phase": {
+                str(phase): int(count)
+                for phase, count in sorted(self.forced_by_phase.items())
+            },
+        }
+
+    def write(self, seq, out_dir):
+        path = os.path.join(out_dir, f"{seq}.oracle_association.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"seq": seq, **self.summary()}, handle, indent=2)
+        return path
+
+
 def track_snapshot(track, fr, gt_tlbr):
     """Per-frame view of a track for the report."""
     pred = track.history.predict.get(fr)
@@ -734,10 +854,11 @@ def main(args):
     os.makedirs(out_dir, exist_ok=True)
     seqs = args.seqs or os.listdir(f"{args.datasets_dir}/{args.dataset}/{args.split}/")
     all_sum = []
+    oracle_summaries = []
     for seq in seqs:
         print(f"\n### running {seq} ...")
         gt_by_frame = load_gt(f"{args.datasets_dir}/{args.dataset}/{args.split}/{seq}", is_mot)
-        tracker, outputs_by_frame, seqlen, attribution = run_and_capture(
+        tracker, outputs_by_frame, seqlen, attribution, oracle_policy, mot_output_lines = run_and_capture(
             args, seq, out_dir, gt_by_frame
         )
         s = analyze(
@@ -747,6 +868,18 @@ def main(args):
         if attribution is not None:
             path = attribution.write(seq, out_dir)
             print(f"  association attribution: {path}")
+        if oracle_policy is not None:
+            output_dir = os.path.join("outputs", args.oracle_tracker_name)
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, f"{seq}.txt")
+            with open(output_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(mot_output_lines))
+                if mot_output_lines:
+                    handle.write("\n")
+            path = oracle_policy.write(seq, out_dir)
+            oracle_summaries.append({"seq": seq, **oracle_policy.summary()})
+            print(f"  oracle MOT output: {output_path}")
+            print(f"  oracle headroom report: {path}")
         all_sum.append(s)
     print("\n=== ALL SEQUENCES ===")
     for s in all_sum:
@@ -754,6 +887,26 @@ def main(args):
               f"causes={s['cause_counts']}")
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(all_sum, f, indent=2)
+    if oracle_summaries:
+        with open(os.path.join(out_dir, "oracle_association_summary.json"), "w", encoding="utf-8") as handle:
+            json.dump(oracle_summaries, handle, indent=2)
+    if args.evaluate_oracle:
+        if not args.oracle_association:
+            raise ValueError("--evaluate_oracle requires --oracle_association")
+        seqmap_dir = os.path.join("trackeval", "seqmap", args.dataset.lower())
+        os.makedirs(seqmap_dir, exist_ok=True)
+        with open(os.path.join(seqmap_dir, "custom.txt"), "w", encoding="utf-8") as handle:
+            handle.write("name\n")
+            for seq in seqs:
+                handle.write(f"{seq}\n")
+        from evaluate import evaluate
+        print("\nevaluating oracle-association upper bound...")
+        evaluate(
+            args.dataset,
+            args.split,
+            trackers_to_eval=[args.oracle_tracker_name],
+            datasets_dir=args.datasets_dir,
+        )
     print(f"\nOutputs in {out_dir}/ : *.report.txt (readable), *.analysis.json (full), "
           f"*.tracker.pkl (histories), *.assoc.log (per-frame association)")
 
@@ -784,6 +937,21 @@ if __name__ == "__main__":
             "or missing GT detection"
         ),
     )
+    p.add_argument(
+        "--oracle_association", action="store_true", default=False,
+        help=(
+            "GT-only causal upper bound: force only prior-track/current-detection "
+            "pairs that production association already offers and considers valid"
+        ),
+    )
+    p.add_argument(
+        "--oracle_tracker_name", default="ocsort-oracle-association",
+        help="output subfolder under outputs/ when --oracle_association is enabled",
+    )
+    p.add_argument(
+        "--evaluate_oracle", action="store_true", default=False,
+        help="run TrackEval for the selected oracle-association sequences",
+    )
     # Tracker options: kept in parity with run_tracker.py so an analysis run
     # reproduces the same tracker behaviour.
     p.add_argument("--max_age", type=int, default=30)
@@ -808,6 +976,13 @@ if __name__ == "__main__":
                    help="reject covariance-improbable candidates without adding Mahalanobis cost")
     p.add_argument("--mahalanobis_cost_coefficient", type=float, default=1.0)
     p.add_argument("--mahalanobis_gate_threshold", type=float, default=9.4877)
+    p.add_argument("--use_learned_association", action="store_true", default=False,
+                   help="add a trained no-ReID association residual to valid candidate costs")
+    p.add_argument("--association_weights_path", default=None,
+                   help="checkpoint produced by train_association_model.py")
+    p.add_argument("--association_device", default=None)
+    p.add_argument("--association_cost_weight", type=float, default=0.10)
+    p.add_argument("--association_residual_clip", type=float, default=0.50)
     p.add_argument("--use_byte", action="store_true", default=True)
     p.add_argument("--no_use_byte", action="store_false", dest="use_byte")
     p.add_argument("--use_oru", action="store_true", default=True)
@@ -824,6 +999,16 @@ if __name__ == "__main__":
     p.add_argument("--lost_output_require_inside_frame", action="store_true", default=True)
     p.add_argument("--lost_output_allow_partial_outside", action="store_false",
                    dest="lost_output_require_inside_frame")
+    p.add_argument("--suppress_duplicate_track_births", action="store_true", default=False,
+                   help="do not initialize a high-score detection that overlaps a mature live/lost track")
+    p.add_argument("--cleanup_duplicate_tracks", action="store_true", default=False,
+                   help="retire a weaker track after persistent high-IoU overlap with a mature observed track")
+    p.add_argument("--duplicate_track_iou_threshold", type=float, default=0.85)
+    p.add_argument("--duplicate_track_min_observations", type=int, default=3)
+    p.add_argument("--duplicate_track_overlap_frames", type=int, default=3)
+    p.add_argument("--prioritize_mature_tracks", action="store_true", default=False,
+                   help="associate mature currently tracking identities before younger or lost tracks in phase 1")
+    p.add_argument("--mature_track_min_observations", type=int, default=3)
     p.add_argument("--reupdate_type", default="constant", choices=["constant", "relative", "none"])
     p.add_argument("--reupdate_constant_weight", type=float, default=0.8)
     p.add_argument("--motion_enabled", action="store_true", default=True)

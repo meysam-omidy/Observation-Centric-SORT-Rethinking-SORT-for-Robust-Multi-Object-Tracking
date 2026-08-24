@@ -6,6 +6,7 @@ from utils import (
 )
 from pydantic import BaseModel, Field
 from motion_predictor import MotionPredictorConfig, MotionPredictorEngine
+from association_model import AssociationScorerEngine, build_pair_features
 from typing import Literal
 import numpy as np
 import logging
@@ -36,6 +37,13 @@ class OCSORTTrackerConfig(BaseModel):
     # 9.4877 is the 95% chi-square quantile for a 4-D SORT measurement.
     mahalanobis_cost_reference : float = Field(default=9.4877, gt=0)
     mahalanobis_gate_threshold : float = Field(default=9.4877, gt=0)
+    # Optional learned geometric association residual. It is deliberately
+    # separate from the motion model and never changes candidate validity.
+    use_learned_association : bool = False
+    association_weights_path : str | None = None
+    association_device : str | None = None
+    association_cost_weight : float = Field(default=0.10, ge=0)
+    association_residual_clip : float = Field(default=0.50, ge=0)
     image_width : int = 1920
     image_height : int = 1080
     use_byte : bool = False
@@ -52,6 +60,18 @@ class OCSORTTrackerConfig(BaseModel):
     lost_output_score_decay : float = Field(default=0.7, gt=0, le=1)
     lost_output_min_score : float = Field(default=0.1, ge=0, le=1)
     lost_output_require_inside_frame : bool = True
+    # Conservative, opt-in lifecycle controls for preventing independently
+    # spawned tracks from following the same object.  They are intentionally
+    # disabled by default so existing experiment baselines remain unchanged.
+    suppress_duplicate_track_births : bool = False
+    cleanup_duplicate_tracks : bool = False
+    duplicate_track_iou_threshold : float = Field(default=0.85, gt=0, le=1)
+    duplicate_track_min_observations : int = Field(default=3, ge=1)
+    duplicate_track_overlap_frames : int = Field(default=3, ge=1)
+    # Give stable, currently observed tracks first use of high-score detections
+    # before recently born or lost tracks can compete for the remainder.
+    prioritize_mature_tracks : bool = False
+    mature_track_min_observations : int = Field(default=3, ge=1)
     # Debug-only, per-frame association matrices. Kept disabled during normal
     # tracking so no extra matrix copies or memory traffic are incurred.
     collect_association_diagnostics : bool = False
@@ -62,18 +82,30 @@ class OCSORTTrackerConfig(BaseModel):
     
 
 class OCSORTTracker:
-    def __init__(self, config:dict={}, motion_engine: MotionPredictorEngine | None = None):
+    def __init__(self, config:dict={}, motion_engine: MotionPredictorEngine | None = None,
+                 association_engine: AssociationScorerEngine | None = None):
         self.config = OCSORTTrackerConfig.model_validate(config)
         self.tracks : list[Track] = []
         self.frame_number = 0
         self.id_counter = 1
         self.last_association_diagnostics: list[dict] = []
+        self._duplicate_overlap_streaks: dict[tuple[int, int], int] = {}
+        self._pending_duplicate_track_deletions: set[int] = set()
         self.motion_engine = motion_engine
+        self.association_engine = association_engine
         if self.config.motion.enabled and self.motion_engine is None:
             try:
                 self.motion_engine = MotionPredictorEngine(self.config.motion)
             except FileNotFoundError as err:
                 print(f'[OCSORTTracker] {err}; using heuristic motion prediction.')
+        if self.config.use_learned_association and self.association_engine is None:
+            if not self.config.association_weights_path:
+                raise ValueError(
+                    "--use_learned_association requires --association_weights_path"
+                )
+            self.association_engine = AssociationScorerEngine(
+                self.config.association_weights_path, self.config.association_device
+            )
         if self.config.log_path:
             self.logger = logging.getLogger(f"{self.__class__.__name__}-{id(self)}")
             self.logger.setLevel(logging.INFO)
@@ -86,7 +118,15 @@ class OCSORTTracker:
         else:
             self.logger = None
 
-    def update(self, boxes): 
+    def update(self, boxes, association_override=None, association_observer=None):
+        """Advance one frame.
+
+        ``association_override`` is an analysis-only callback.  When supplied,
+        it may force a disjoint set of already-valid track/detection pairs in
+        each association phase.  It cannot introduce a detection, bypass a
+        gate, or alter the Kalman predict/update path.  Normal tracking never
+        supplies this callback.
+        """
         self.predict_tracks()
         # A consumer such as analyze_tracking.py reads this immediately after
         # update. Retaining only the current frame prevents a diagnostic run
@@ -111,13 +151,15 @@ class OCSORTTracker:
         low_confidence_detections = boxes[low_mask][:, :4]
         low_scores = boxes[low_mask][:, 4]
         confirmed_tracks = self.get_tracks([StateTracking, StateLost])   
-        matches, unmatched_confirmed_track_indices, unmatched_high_confidence_detection_indices = self.associate(
+        matches, unmatched_confirmed_track_indices, unmatched_high_confidence_detection_indices = self._associate_confirmed_tracks(
             confirmed_tracks, 
             high_confidence_detections, 
             high_scores,
             self.config.match_high_score_dets_with_confirmed_trks_threshold,
             phase=1,
             detection_indices=high_detection_indices,
+            association_override=association_override,
+            association_observer=association_observer,
         )
         self._update_matches(
             confirmed_tracks, high_confidence_detections, high_scores, matches
@@ -125,8 +167,8 @@ class OCSORTTracker:
 
         if self.config.use_byte:
             remained_confirmed_tracks = select_indices(confirmed_tracks, unmatched_confirmed_track_indices)
-            # remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking]]
-            remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking, StateLost]]
+            remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking]]
+            # remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking, StateLost]]
             matches, unmatched_remained_track_indices, unmatched_low_score_detection_indices = self.associate(
                 remained_tracking_tracks, 
                 low_confidence_detections, 
@@ -134,6 +176,8 @@ class OCSORTTracker:
                 self.config.match_low_score_dets_with_confirmed_trks_threshold,
                 phase=2,
                 detection_indices=low_detection_indices,
+                association_override=association_override,
+                association_observer=association_observer,
             )
             self._update_matches(
                 remained_tracking_tracks, low_confidence_detections, low_scores, matches
@@ -152,6 +196,8 @@ class OCSORTTracker:
             self.config.match_remained_high_score_dets_with_unconfirmed_trks_threshold,
             phase=3,
             detection_indices=np.asarray(remained_high_detection_indices, dtype=int),
+            association_override=association_override,
+            association_observer=association_observer,
         )
         self._update_matches(
             unconfirmed_tracks,
@@ -159,11 +205,21 @@ class OCSORTTracker:
             remained_high_scores,
             matches,
         )
+
+        # Observe duplicate candidates only after every association phase has
+        # consumed this frame.  Deletion is deferred to the next frame so a
+        # real current-frame update is never silently removed from the output.
+        self._queue_duplicate_track_cleanup()
         
         unmatched_remained_high_score_detections = select_indices(remained_high_confidence_detections, unmatched_remained_high_score_detection_indices)
         unmatched_remained_high_scores = select_indices(remained_high_scores, unmatched_remained_high_score_detection_indices)
         for d, s in zip(unmatched_remained_high_score_detections, unmatched_remained_high_scores):
             if s < self.config.init_track_score_threshold:
+                continue
+            if (
+                self.config.suppress_duplicate_track_births
+                and self._is_duplicate_track_birth(d)
+            ):
                 continue
             self.init_track(d, s)
 
@@ -176,6 +232,187 @@ class OCSORTTracker:
         else:
             self.tracks.append(Track(bbox, score, self.id_counter, self.frame_number, track_config, StateUnconfirmed))
         self.id_counter += 1
+
+    def _is_mature_tracking_track(self, track: Track) -> bool:
+        return (
+            track.state == StateTracking
+            and track.observation_count >= self.config.mature_track_min_observations
+        )
+
+    def _associate_confirmed_tracks(
+        self,
+        tracks: list[Track],
+        detections: np.ndarray,
+        scores: np.ndarray,
+        iou_threshold: float,
+        phase: int,
+        detection_indices: np.ndarray,
+        association_override=None,
+        association_observer=None,
+    ):
+        """Optionally use a two-pass, maturity-aware high-score association.
+
+        The first pass protects established *currently tracking* identities.
+        Unmatched mature tracks receive a normal second chance with all other
+        tracks, so the policy does not turn a weak mature prediction into a
+        hard gate.  Returned indices always refer to the original inputs.
+        """
+        if not self.config.prioritize_mature_tracks:
+            return self.associate(
+                tracks, detections, scores, iou_threshold, phase,
+                detection_indices=detection_indices,
+                association_override=association_override,
+                association_observer=association_observer,
+            )
+
+        mature_indices = [
+            index for index, track in enumerate(tracks)
+            if self._is_mature_tracking_track(track)
+        ]
+        # With zero or all mature tracks a cascade would be exactly the same
+        # matching problem while adding a second assignment call.
+        if not mature_indices or len(mature_indices) == len(tracks):
+            return self.associate(
+                tracks, detections, scores, iou_threshold, phase,
+                detection_indices=detection_indices,
+                association_override=association_override,
+                association_observer=association_observer,
+            )
+
+        mature_tracks = [tracks[index] for index in mature_indices]
+        first_matches, _, unmatched_detection_indices = self.associate(
+            mature_tracks,
+            detections,
+            scores,
+            iou_threshold,
+            phase,
+            detection_indices=detection_indices,
+            association_override=association_override,
+            association_observer=association_observer,
+        )
+        first_matches = [
+            [mature_indices[track_index], detection_index]
+            for track_index, detection_index in first_matches
+        ]
+        matched_mature_indices = {match[0] for match in first_matches}
+        remaining_track_indices = [
+            index for index in range(len(tracks))
+            if index not in matched_mature_indices
+        ]
+        remaining_detection_indices = list(unmatched_detection_indices)
+
+        second_matches: list[list[int]] = []
+        if remaining_track_indices and remaining_detection_indices:
+            second_tracks = [tracks[index] for index in remaining_track_indices]
+            second_detections = detections[remaining_detection_indices]
+            second_scores = scores[remaining_detection_indices]
+            second_detection_ids = detection_indices[remaining_detection_indices]
+            local_matches, _, unmatched_second_detections = self.associate(
+                second_tracks,
+                second_detections,
+                second_scores,
+                iou_threshold,
+                phase,
+                detection_indices=second_detection_ids,
+                association_override=association_override,
+                association_observer=association_observer,
+            )
+            second_matches = [
+                [
+                    remaining_track_indices[track_index],
+                    remaining_detection_indices[detection_index],
+                ]
+                for track_index, detection_index in local_matches
+            ]
+            unmatched_detection_indices = [
+                remaining_detection_indices[index]
+                for index in unmatched_second_detections
+            ]
+
+        matches = sorted(first_matches + second_matches)
+        matched_track_indices = {track_index for track_index, _ in matches}
+        unmatched_track_indices = [
+            index for index in range(len(tracks))
+            if index not in matched_track_indices
+        ]
+        return matches, unmatched_track_indices, list(unmatched_detection_indices)
+
+    def _is_duplicate_track_birth(self, detection: np.ndarray) -> bool:
+        """Whether an unmatched detection is already covered by a mature track."""
+        candidates = [
+            track for track in self.get_tracks([StateTracking, StateLost])
+            if track.observation_count >= self.config.duplicate_track_min_observations
+        ]
+        if not candidates:
+            return False
+        candidate_boxes = np.asarray([track.bbox.to_tlbr() for track in candidates])
+        overlap = batch_iou(candidate_boxes, np.asarray(detection, dtype=float).reshape(1, 4))
+        return bool(np.any(overlap[:, 0] >= self.config.duplicate_track_iou_threshold))
+
+    @staticmethod
+    def _duplicate_track_winner(first: Track, second: Track) -> Track:
+        """Deterministically retain the more established duplicate candidate."""
+        first_key = (first.observation_count, -first.entered_frame, first.score, -first.id)
+        second_key = (second.observation_count, -second.entered_frame, second.score, -second.id)
+        return first if first_key >= second_key else second
+
+    def _queue_duplicate_track_cleanup(self) -> None:
+        """Queue persistent, highly-overlapping observed tracks for retirement.
+
+        Two independently assigned boxes can momentarily overlap during a
+        crossing.  Requiring real observations on both tracks and the same
+        high overlap for several consecutive frames makes this deliberately
+        conservative.  The loser is deleted at the following predict step.
+        """
+        if not self.config.cleanup_duplicate_tracks:
+            self._duplicate_overlap_streaks.clear()
+            return
+
+        candidates = []
+        for track in self.get_tracks([StateTracking]):
+            item = track.history.update.get(track.current_frame)
+            if (
+                item is not None
+                and item.observed
+                and track.observation_count >= self.config.duplicate_track_min_observations
+            ):
+                candidates.append(track)
+
+        active_pairs: set[tuple[int, int]] = set()
+        losers: set[int] = set()
+        if len(candidates) >= 2:
+            boxes = np.asarray([track.bbox.to_tlbr() for track in candidates])
+            overlaps = batch_iou(boxes, boxes)
+            for first_index in range(len(candidates) - 1):
+                for second_index in range(first_index + 1, len(candidates)):
+                    if overlaps[first_index, second_index] < self.config.duplicate_track_iou_threshold:
+                        continue
+                    first, second = candidates[first_index], candidates[second_index]
+                    pair = tuple(sorted((int(first.id), int(second.id))))
+                    active_pairs.add(pair)
+                    streak = self._duplicate_overlap_streaks.get(pair, 0) + 1
+                    self._duplicate_overlap_streaks[pair] = streak
+                    if streak >= self.config.duplicate_track_overlap_frames:
+                        winner = self._duplicate_track_winner(first, second)
+                        loser = second if winner is first else first
+                        losers.add(int(loser.id))
+
+        self._duplicate_overlap_streaks = {
+            pair: self._duplicate_overlap_streaks[pair]
+            for pair in active_pairs
+        }
+        self._pending_duplicate_track_deletions.update(losers)
+
+    def _apply_pending_duplicate_track_deletions(self) -> None:
+        if not self._pending_duplicate_track_deletions:
+            return
+        pending = self._pending_duplicate_track_deletions
+        self._pending_duplicate_track_deletions = set()
+        for track in self.tracks:
+            if track.id in pending and track.state != StateDeleted:
+                track.last_state = track.state
+                track.state = StateDeleted
+                track.exited_frame = self.frame_number - 1
 
     @staticmethod
     def _cv_bbox(k_last_updates) -> np.ndarray:
@@ -267,6 +504,10 @@ class OCSORTTracker:
 
     def predict_tracks(self):
         self.frame_number += 1
+        # Duplicate retirement is deliberately applied one frame after the
+        # confirming overlap, preserving the just-observed output at the frame
+        # where the evidence was gathered.
+        self._apply_pending_duplicate_track_deletions()
         active_tracks = self.get_tracks([StateTracking, StateLost, StateUnconfirmed])
         for track in active_tracks:
             track.predict()
@@ -587,6 +828,8 @@ class OCSORTTracker:
         iou_threshold: float,
         phase: int,
         detection_indices: np.ndarray | None = None,
+        association_override=None,
+        association_observer=None,
     ):
         detections = np.asarray(detections, dtype=float).reshape(-1, 4)
         scores = np.asarray(scores, dtype=float).reshape(-1)
@@ -631,6 +874,26 @@ class OCSORTTracker:
         iou_cost = 1 - batch_iou(track_tlbrs, detections)
         iou_valid_pairs = (1 - iou_cost) > iou_threshold
         cost = self.config.association_iou_coefficient * iou_cost + speed_direction_coefficient_matrix * speed_directions_cost
+        learned_residual = None
+        if self.association_engine is not None:
+            # Score only pairs that have passed the existing IoU gate. Invalid
+            # cells retain their original sentinel cost below.
+            learned_features = build_pair_features(
+                tracks, detections, scores, 1 - iou_cost, speed_directions_cost,
+                self.config.image_width, self.config.image_height,
+            )
+            learned_residual = np.zeros_like(cost)
+            candidate_rows, candidate_cols = np.nonzero(iou_valid_pairs)
+            if len(candidate_rows):
+                logits = self.association_engine.predict_logits(
+                    learned_features[candidate_rows, candidate_cols]
+                )
+                learned_residual[candidate_rows, candidate_cols] = np.clip(
+                    -np.tanh(logits),
+                    -self.config.association_residual_clip,
+                    self.config.association_residual_clip,
+                )
+                cost += self.config.association_cost_weight * learned_residual
         # The original flag remains a compatibility alias for the old coupled
         # behaviour.  New callers can evaluate the ranking cost and rejection
         # gate separately.
@@ -685,7 +948,52 @@ class OCSORTTracker:
         # The assignment must still be solved globally; invalid assignments are
         # removed below.  A large cost prevents them displacing valid candidates.
         cost = np.where(invalid_pairs, 1e6, cost)
-        matched_tracks, unmatched_tracks, unmatched_detections = assignment(cost)
+        if association_observer is not None:
+            association_observer(
+                phase=phase,
+                tracks=tracks,
+                detections=detections,
+                scores=scores,
+                detection_indices=detection_indices,
+                iou=1 - iou_cost,
+                direction_cost=speed_directions_cost,
+                valid_pairs=~invalid_pairs,
+                base_cost=cost,
+            )
+        forced_matches = []
+        if association_override is not None:
+            requested = association_override(
+                phase=phase,
+                tracks=tracks,
+                detection_indices=detection_indices,
+                valid_pairs=~invalid_pairs,
+                cost=cost,
+            )
+            seen_tracks, seen_detections = set(), set()
+            for pair in requested or []:
+                if len(pair) != 2:
+                    raise ValueError("association_override pairs must be (track_index, detection_index)")
+                track_index, detection_index = map(int, pair)
+                if not (0 <= track_index < len(tracks) and 0 <= detection_index < len(detections)):
+                    raise ValueError("association_override returned an out-of-range pair")
+                if not (~invalid_pairs)[track_index, detection_index]:
+                    raise ValueError("association_override may force only valid pairs")
+                if track_index in seen_tracks or detection_index in seen_detections:
+                    raise ValueError("association_override pairs must be one-to-one")
+                seen_tracks.add(track_index)
+                seen_detections.add(detection_index)
+                forced_matches.append([track_index, detection_index])
+
+        assignment_cost = cost
+        if forced_matches:
+            # Preserve the normal global assignment for all remaining rows and
+            # columns, while making each requested valid pair unavoidable.
+            assignment_cost = cost.copy()
+            for track_index, detection_index in forced_matches:
+                assignment_cost[track_index, :] = 1e6
+                assignment_cost[:, detection_index] = 1e6
+                assignment_cost[track_index, detection_index] = -1e6
+        matched_tracks, unmatched_tracks, unmatched_detections = assignment(assignment_cost)
         matchs_to_remove = []
         for i, j in matched_tracks:
             if invalid_pairs[i, j]:
@@ -721,6 +1029,9 @@ class OCSORTTracker:
                 self.logger.info(f'{np.array2string(invalid_mahalanobis_pairs)}')
                 self.logger.info('mahalanobis_cost')
                 self.logger.info(f'{np.array2string(mahalanobis_cost)}')
+            if learned_residual is not None:
+                self.logger.info('learned_association_residual')
+                self.logger.info(f'{np.array2string(learned_residual, precision=3, suppress_small=True)}')
             self.logger.info(f'speed_directions_cost')
             self.logger.info(f'{np.array2string(speed_directions_cost, precision=3, suppress_small=True)}')
             self.logger.info(f'cost')

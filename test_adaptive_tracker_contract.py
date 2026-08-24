@@ -14,7 +14,7 @@ import run_qr_scale_sweep
 from ocsort import OCSORTTracker, OCSORTTrackerConfig
 from run_tracker import LockedMotionPredictorEngine
 from track import Track, TrackConfig, TrackHistory, TrackHistoryItem
-from track_state import StateTracking
+from track_state import StateDeleted, StateTracking
 from utils import BBOX
 
 
@@ -173,6 +173,87 @@ class AdaptiveTrackerContractTest(unittest.TestCase):
         self.assertEqual(matches, [[0, 0]])
         self.assertEqual(unmatched_tracks, [])
         self.assertEqual(unmatched_detections, [])
+
+    def test_duplicate_birth_suppression_only_flags_a_mature_overlapping_track(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'suppress_duplicate_track_births': True,
+            'duplicate_track_iou_threshold': 0.85,
+            'duplicate_track_min_observations': 1,
+        })
+        tracker.frame_number = 1
+        tracker.init_track(np.array([10.0, 10.0, 30.0, 30.0]), 0.9)
+
+        self.assertTrue(tracker._is_duplicate_track_birth(
+            np.array([10.5, 10.0, 30.5, 30.0])
+        ))
+        self.assertFalse(tracker._is_duplicate_track_birth(
+            np.array([45.0, 10.0, 65.0, 30.0])
+        ))
+
+    def test_duplicate_cleanup_defers_retirement_until_the_next_predict_step(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'cleanup_duplicate_tracks': True,
+            'duplicate_track_iou_threshold': 0.85,
+            'duplicate_track_min_observations': 1,
+            'duplicate_track_overlap_frames': 1,
+        })
+        tracker.frame_number = 1
+        tracker.init_track(np.array([10.0, 10.0, 30.0, 30.0]), 0.9)
+        tracker.init_track(np.array([10.5, 10.0, 30.5, 30.0]), 0.8)
+
+        tracker._queue_duplicate_track_cleanup()
+        self.assertEqual({track.id for track in tracker.tracks if track.state == StateTracking}, {1, 2})
+        self.assertEqual(tracker._pending_duplicate_track_deletions, {2})
+
+        tracker.predict_tracks()
+        self.assertEqual(tracker.tracks[0].state, StateTracking)
+        self.assertEqual(tracker.tracks[1].state, StateDeleted)
+        self.assertEqual(tracker.tracks[1].exited_frame, 1)
+
+    def test_mature_priority_cascades_before_younger_or_lost_tracks(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'prioritize_mature_tracks': True,
+            'mature_track_min_observations': 3,
+        })
+
+        def fake_track(track_id, observation_count):
+            return SimpleNamespace(
+                id=track_id,
+                state=StateTracking,
+                observation_count=observation_count,
+            )
+
+        mature = fake_track(10, 3)
+        younger = fake_track(20, 1)
+        detections = np.array([
+            [0.0, 0.0, 10.0, 10.0],
+            [20.0, 0.0, 30.0, 10.0],
+        ])
+        scores = np.array([0.9, 0.9])
+        with patch.object(
+            tracker,
+            'associate',
+            side_effect=[
+                ([[0, 0]], [], [1]),  # mature track claims detection 0
+                ([[0, 0]], [], []),   # younger track receives remaining detection 1
+            ],
+        ) as associate:
+            matches, unmatched_tracks, unmatched_detections = tracker._associate_confirmed_tracks(
+                [mature, younger], detections, scores, 0.2, phase=1,
+                detection_indices=np.array([4, 7]),
+            )
+
+        self.assertEqual(matches, [[0, 0], [1, 1]])
+        self.assertEqual(unmatched_tracks, [])
+        self.assertEqual(unmatched_detections, [])
+        self.assertEqual([track.id for track in associate.call_args_list[0].args[0]], [10])
+        self.assertEqual([track.id for track in associate.call_args_list[1].args[0]], [20])
+        np.testing.assert_array_equal(
+            associate.call_args_list[1].kwargs['detection_indices'], [7]
+        )
 
     def test_lost_track_output_is_opt_in_and_decays_prediction_score(self):
         base_config = {

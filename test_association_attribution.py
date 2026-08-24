@@ -89,6 +89,34 @@ class AssociationDiagnosticsContractTest(unittest.TestCase):
         self.assertEqual(phase_one["cost"].shape, (0, 1))
         self.assertEqual(phase_one["valid_pairs"].dtype, np.dtype(bool))
 
+    def test_oracle_callback_can_force_only_an_already_valid_pair(self):
+        tracker = OCSORTTracker({"motion": {"enabled": False}})
+        tracker.update(np.array([[10.0, 10.0, 30.0, 30.0, 0.9]]))
+        track = tracker.tracks[0]
+
+        calls = []
+
+        def force_second_candidate(**event):
+            calls.append(event)
+            self.assertEqual(event["phase"], 1)
+            self.assertTrue(event["valid_pairs"][0, 1])
+            return [(0, 1)]
+
+        matches, _, _ = tracker.associate(
+            [track],
+            np.array([
+                [10.0, 10.0, 30.0, 30.0],
+                [15.0, 10.0, 35.0, 30.0],
+            ]),
+            np.array([0.9, 0.9]),
+            iou_threshold=0.2,
+            phase=1,
+            association_override=force_second_candidate,
+        )
+
+        self.assertEqual(matches, [[0, 1]])
+        self.assertEqual(len(calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

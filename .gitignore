@@ -218,3 +218,5 @@ logs/
 eval/
 *.ipynb
 *.pth
+association_data
+checkpoints

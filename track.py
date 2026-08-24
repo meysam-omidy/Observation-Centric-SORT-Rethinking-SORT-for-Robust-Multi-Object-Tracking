@@ -184,6 +184,19 @@ class Track:
             return float(get_dict_item(self.history.update, -1).score)
         else:
             return 0
+
+    @property
+    def observation_count(self) -> int:
+        """Number of real detector updates accumulated by this track.
+
+        OC-SORT re-update can insert virtual history entries after a gap.  They
+        are useful for motion features, but must not make a recently observed
+        track appear more established than it really is for lifecycle policy.
+        """
+        return sum(
+            1 for item in self.history.update.values()
+            if item.observed
+        )
     
     @property
     def k_last_observation(self) -> np.ndarray:

@@ -23,6 +23,7 @@ import numpy as np
 import configparser
 
 from ocsort import OCSORTTracker
+from association_model import AssociationScorerEngine
 from evaluate import evaluate
 from motion_predictor import MotionPredictorConfig, MotionPredictorEngine
 
@@ -68,6 +69,18 @@ class LockedMotionPredictorEngine:
             return self._engine.predict_batch(*args, **kwargs)
 
 
+class LockedAssociationScorerEngine:
+    """Share the tiny read-only scorer without reloading it per sequence."""
+
+    def __init__(self, engine: AssociationScorerEngine):
+        self._engine = engine
+        self._inference_lock = threading.Lock()
+
+    def predict_logits(self, *args, **kwargs):
+        with self._inference_lock:
+            return self._engine.predict_logits(*args, **kwargs)
+
+
 def tracker_config(
     args,
     image_width: str,
@@ -96,6 +109,11 @@ def tracker_config(
         'use_mahalanobis_gate': args.use_mahalanobis_gate,
         'mahalanobis_cost_coefficient': args.mahalanobis_cost_coefficient,
         'mahalanobis_gate_threshold': args.mahalanobis_gate_threshold,
+        'use_learned_association': getattr(args, 'use_learned_association', False),
+        'association_weights_path': getattr(args, 'association_weights_path', None),
+        'association_device': getattr(args, 'association_device', None),
+        'association_cost_weight': getattr(args, 'association_cost_weight', 0.10),
+        'association_residual_clip': getattr(args, 'association_residual_clip', 0.50),
         'use_byte': args.use_byte,
         'use_oru': args.use_oru,
         'use_confidence_r': args.use_confidence_r,
@@ -107,6 +125,13 @@ def tracker_config(
         'lost_output_score_decay': args.lost_output_score_decay,
         'lost_output_min_score': args.lost_output_min_score,
         'lost_output_require_inside_frame': args.lost_output_require_inside_frame,
+        'suppress_duplicate_track_births': args.suppress_duplicate_track_births,
+        'cleanup_duplicate_tracks': args.cleanup_duplicate_tracks,
+        'duplicate_track_iou_threshold': args.duplicate_track_iou_threshold,
+        'duplicate_track_min_observations': args.duplicate_track_min_observations,
+        'duplicate_track_overlap_frames': args.duplicate_track_overlap_frames,
+        'prioritize_mature_tracks': args.prioritize_mature_tracks,
+        'mature_track_min_observations': args.mature_track_min_observations,
         'reupdate_type': args.reupdate_type,
         'reupdate_constant_weight': args.reupdate_constant_weight,
         'log_path': log_path,
@@ -151,7 +176,7 @@ def sequence_log_path(args, seq: str) -> str | None:
     return path
 
 
-def run(seq: str, args, motion_engine=None) -> None:
+def run(seq: str, args, motion_engine=None, association_engine=None) -> None:
     print(f'[{seq}] starting')
     started = time.perf_counter()
     detections = np.loadtxt(detection_file_path(args, seq), delimiter=',')
@@ -166,6 +191,7 @@ def run(seq: str, args, motion_engine=None) -> None:
             log_path=sequence_log_path(args, seq),
         ),
         motion_engine=motion_engine,
+        association_engine=association_engine,
     )
     os.makedirs(f'outputs/{args.tracker_name}', exist_ok=True)
     output_path = f'outputs/{args.tracker_name}/{seq}.txt'
@@ -198,6 +224,17 @@ def build_shared_motion_engine(args, workers: int):
     return LockedMotionPredictorEngine(engine) if workers > 1 else engine
 
 
+def build_shared_association_engine(args, workers: int):
+    if not getattr(args, 'use_learned_association', False):
+        return None
+    if not getattr(args, 'association_weights_path', None):
+        raise ValueError("--use_learned_association requires --association_weights_path")
+    engine = AssociationScorerEngine(
+        args.association_weights_path, getattr(args, 'association_device', None)
+    )
+    return LockedAssociationScorerEngine(engine) if workers > 1 else engine
+
+
 def main(args) -> None:
     # Preserve user ordering while preventing two workers from targeting the same file.
     seqs = list(dict.fromkeys(collect_seqs(args)))
@@ -213,15 +250,23 @@ def main(args) -> None:
 
     os.makedirs(f'outputs/{args.tracker_name}', exist_ok=True)
     motion_engine = build_shared_motion_engine(args, workers)
+    association_engine = build_shared_association_engine(args, workers)
 
     print(f'tracking {len(seqs)} sequence(s) with {workers} worker(s)...')
+    def run_sequence(seq):
+        # Retain the long-standing three-argument run call when the optional
+        # scorer is disabled (also keeps external scripts/tests compatible).
+        if association_engine is None:
+            return run(seq, args, motion_engine)
+        return run(seq, args, motion_engine, association_engine)
+
     if workers == 1:
         for seq in seqs:
-            run(seq, args, motion_engine)
+            run_sequence(seq)
     else:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='ocsort-seq') as executor:
             futures = {
-                executor.submit(run, seq, args, motion_engine): seq
+                executor.submit(run_sequence, seq): seq
                 for seq in seqs
             }
             for future in as_completed(futures):
@@ -286,6 +331,16 @@ if __name__ == '__main__':
                    help='weight of squared Mahalanobis distance normalized by the fixed 4-D 95%% reference')
     p.add_argument('--mahalanobis_gate_threshold', type=float, default=9.4877,
                    help='maximum squared Mahalanobis distance when --use_mahalanobis_gate is enabled')
+    p.add_argument('--use_learned_association', action='store_true', default=False,
+                   help='add a trained no-ReID association residual to valid OC-SORT candidate costs')
+    p.add_argument('--association_weights_path', type=str, default=None,
+                   help='checkpoint produced by train_association_model.py')
+    p.add_argument('--association_device', type=str, default=None,
+                   help='device for association scorer; default = auto')
+    p.add_argument('--association_cost_weight', type=float, default=0.10,
+                   help='non-negative multiplier for bounded learned association residual')
+    p.add_argument('--association_residual_clip', type=float, default=0.50,
+                   help='absolute residual cap before association_cost_weight is applied')
     p.add_argument('--use_byte', action='store_true', default=True)
     p.add_argument('--no_use_byte', action='store_false', dest='use_byte')
     p.add_argument('--use_oru', action='store_true', default=True,
@@ -318,6 +373,34 @@ if __name__ == '__main__':
     p.add_argument('--lost_output_allow_partial_outside', action='store_false',
                    dest='lost_output_require_inside_frame',
                    help='allow lost-track predictions whose boxes partially leave the frame')
+    p.add_argument(
+        '--suppress_duplicate_track_births', action='store_true', default=False,
+        help='do not initialize an unmatched high-score detection that overlaps a mature live/lost track',
+    )
+    p.add_argument(
+        '--cleanup_duplicate_tracks', action='store_true', default=False,
+        help='retire a weaker track after persistent high-IoU overlap with a mature observed track',
+    )
+    p.add_argument(
+        '--duplicate_track_iou_threshold', type=float, default=0.85,
+        help='IoU required by duplicate-birth suppression and duplicate-track cleanup',
+    )
+    p.add_argument(
+        '--duplicate_track_min_observations', type=int, default=3,
+        help='real detector updates required before a track participates in duplicate control',
+    )
+    p.add_argument(
+        '--duplicate_track_overlap_frames', type=int, default=3,
+        help='consecutive observed overlapping frames required before duplicate cleanup retires a track',
+    )
+    p.add_argument(
+        '--prioritize_mature_tracks', action='store_true', default=False,
+        help='associate mature currently tracking identities before younger or lost tracks in phase 1',
+    )
+    p.add_argument(
+        '--mature_track_min_observations', type=int, default=3,
+        help='real detector updates required for phase-1 mature-track priority',
+    )
     p.add_argument('--reupdate_type', type=str, default='constant', choices=['constant', 'relative', 'none'])
     p.add_argument('--reupdate_constant_weight', type=float, default=0.8)
 
