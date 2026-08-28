@@ -91,6 +91,24 @@ class AssociationModelContractTest(unittest.TestCase):
             )
         self.assertEqual(captured[0][0, 0], 1e6)
 
+    def test_listwise_logits_become_row_relative_softmax_residuals(self):
+        # The association model is trained with one softmax group per source
+        # track. A common negative offset must not make every candidate receive
+        # the same positive penalty at inference.
+        residual = OCSORTTracker._learned_association_residual_from_logits(
+            logits=np.array([-10.0, -12.0, 4.0]),
+            candidate_rows=np.array([0, 0, 1]),
+            candidate_cols=np.array([0, 2, 1]),
+            shape=(2, 3),
+            residual_clip=1.0,
+        )
+        probability = np.exp(2.0) / (1.0 + np.exp(2.0))
+        np.testing.assert_allclose(
+            residual,
+            [[0.5 - probability, 0.0, probability - 0.5], [0.0, 0.0, 0.0]],
+        )
+        self.assertAlmostEqual(residual[0].sum(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

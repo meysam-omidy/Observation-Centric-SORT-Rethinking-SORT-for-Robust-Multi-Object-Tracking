@@ -24,9 +24,9 @@ class MotionPredictorConfig(BaseModel):
         description='cuda | cpu | mps; None = auto (cuda if torch.cuda.is_available())',
     )
     d_model: int = 256
-    nhead: int = 8
+    nhead: int = 32
     num_layers: int = 6
-    dim_ff: int = 1024
+    dim_ff: int = 512
     dropout: float = 0.1
     lstm_hidden_dim: int = 256
     lstm_num_layers: int = 2

@@ -220,3 +220,4 @@ eval/
 *.pth
 association_data*
 checkpoints
+benchmark_results

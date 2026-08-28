@@ -147,6 +147,38 @@ class AdaptiveTrackerContractTest(unittest.TestCase):
         self.assertEqual(unmatched_tracks, [])
         self.assertEqual(unmatched_detections, [])
 
+    def test_mahalanobis_soft_cost_is_normalized_and_clamped(self):
+        tracker = OCSORTTracker({
+            'motion': {'enabled': False},
+            'association_speed_direction_coefficient': 0.0,
+            'use_mahalanobis_cost': True,
+            'mahalanobis_cost_coefficient': 1.0,
+            'mahalanobis_cost_reference': 10.0,
+        })
+        tracker.init_track(np.array([0.0, 0.0, 20.0, 20.0]), 0.9)
+        observed_costs = []
+        detections = np.array([
+            [0.0, 0.0, 20.0, 20.0],
+            [0.0, 0.0, 20.0, 20.0],
+        ])
+
+        with patch.object(
+            tracker,
+            '_mahalanobis_distances',
+            return_value=np.array([[2.5, 100.0]]),
+        ):
+            tracker.associate(
+                tracker.tracks,
+                detections,
+                np.array([0.9, 0.9]),
+                iou_threshold=0.2,
+                phase=1,
+                association_observer=lambda **event: observed_costs.append(event['base_cost']),
+            )
+
+        self.assertEqual(len(observed_costs), 1)
+        np.testing.assert_allclose(observed_costs[0], [[0.25, 1.0]])
+
     def test_mahalanobis_cost_falls_back_when_distance_is_non_finite(self):
         tracker = OCSORTTracker({
             'motion': {'enabled': False},

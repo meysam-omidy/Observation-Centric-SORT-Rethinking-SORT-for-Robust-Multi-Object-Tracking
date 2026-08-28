@@ -62,7 +62,7 @@ def _write_per_seq_comparison(metrics, trackers, seqs, path):
 @count_time
 def evaluate(dataset, split, trackers_to_eval=None, datasets_dir=None):
     if trackers_to_eval is None:
-        trackers_to_eval = ['ocsort-wbrt-final-baseline', 'ocsort-wbrt-learned-assoc-final', 'oc-sort', 'conf-r-rerun']
+        trackers_to_eval = ['ocsort-self', 'ocsort-wbrt-learned-assoc-final', 'oc-sort', 'conf-r-rerun']
         # trackers_to_eval = ['ocsort-self', 'ocsort-self-v', 'oc-sort', 'ocsort-self-wbrt', 'official-ocsort-yoloxx']
         # trackers_to_eval = ['ocsort-self', 'ocsort-self-v', 'oc-sort', 'ocsort-self-transformer', 'ocsort-self-wbrt']
     if datasets_dir is None:

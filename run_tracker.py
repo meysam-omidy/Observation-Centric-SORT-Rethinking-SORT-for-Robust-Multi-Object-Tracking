@@ -286,8 +286,9 @@ def main(args) -> None:
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description='Run OC-SORT with the adaptive Kalman Q/R motion model')
 
-    p.add_argument('--dataset', type=str, default='MOT17', choices=['MOT17', 'MOT20', 'DanceTrack'])
+    p.add_argument('--dataset', type=str, default='DanceTrack', choices=['MOT17', 'MOT20', 'DanceTrack'])
     p.add_argument('--split', type=str, default='val')
+    # p.add_argument('--seqs', type=str, nargs='*', default=['dancetrack0026', 'dancetrack0034', 'dancetrack0041', 'dancetrack0043', 'dancetrack0081', 'dancetrack0094'], help='specific sequence names; default = whole split')
     p.add_argument('--seqs', type=str, nargs='*', default=None, help='specific sequence names; default = whole split')
     p.add_argument('--datasets_dir', type=str, default='C:/Projects/.Datasets')
     p.add_argument('--detections_dir', type=str, default='C:/Projects/.Detections',
@@ -345,7 +346,7 @@ if __name__ == '__main__':
     p.add_argument('--association_cost_weight', type=float, default=0.10,
                    help='non-negative multiplier for bounded learned association residual')
     p.add_argument('--association_residual_clip', type=float, default=0.50,
-                   help='absolute residual cap before association_cost_weight is applied')
+                   help='absolute cap on the centered per-track softmax residual')
     p.add_argument('--use_byte', action='store_true', default=True)
     p.add_argument('--no_use_byte', action='store_false', dest='use_byte')
     p.add_argument('--use_oru', action='store_true', default=False,
@@ -406,7 +407,7 @@ if __name__ == '__main__':
         '--mature_track_min_observations', type=int, default=3,
         help='real detector updates required for phase-1 mature-track priority',
     )
-    p.add_argument('--reupdate_type', type=str, default='constant', choices=['constant', 'relative', 'none'])
+    p.add_argument('--reupdate_type', type=str, default=None, choices=['constant', 'relative', 'none'])
     p.add_argument('--reupdate_constant_weight', type=float, default=0.8)
 
     p.add_argument('--motion_enabled', action='store_true', default=True)
@@ -439,4 +440,5 @@ if __name__ == '__main__':
         args.reupdate_type = None
     if args.log_path == 'none':
         args.log_path = None
+    print(args)
     main(args)

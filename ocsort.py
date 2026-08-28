@@ -37,17 +37,22 @@ class OCSORTTrackerConfig(BaseModel):
     use_mahalanobis_cost : bool = False
     use_mahalanobis_gate : bool = False
     mahalanobis_cost_coefficient : float = Field(default=1.0, ge=0)
-    # Keep cost normalization independent from the optional hard-gate radius.
-    # 9.4877 is the 95% chi-square quantile for a 4-D SORT measurement.
+    # The soft ranking term is clip(d^2 / reference, 0, 1), keeping it on the
+    # same bounded scale as IoU and direction costs.  This is intentionally
+    # independent from the optional raw-distance hard-gate radius.  9.4877 is
+    # the 95% chi-square quantile for a 4-D SORT measurement.
     mahalanobis_cost_reference : float = Field(default=9.4877, gt=0)
     mahalanobis_gate_threshold : float = Field(default=9.4877, gt=0)
-    # Optional learned geometric association residual. It is deliberately
-    # separate from the motion model and never changes candidate validity.
+    # Optional learned geometric association residual. The scorer is trained
+    # listwise, so inference converts logits to a per-track softmax and centers
+    # each candidate probability around the uniform row probability. It is
+    # deliberately separate from the motion model and never changes candidate
+    # validity.
     use_learned_association : bool = False
     association_weights_path : str | None = None
     association_device : str | None = None
     association_cost_weight : float = Field(default=0.10, ge=0)
-    association_residual_clip : float = Field(default=0.50, ge=0)
+    association_residual_clip : float = Field(default=0.50, ge=0, le=1)
     image_width : int = 1920
     image_height : int = 1080
     use_byte : bool = False
@@ -892,9 +897,11 @@ class OCSORTTracker:
                 logits = self.association_engine.predict_logits(
                     learned_features[candidate_rows, candidate_cols]
                 )
-                learned_residual[candidate_rows, candidate_cols] = np.clip(
-                    -np.tanh(logits),
-                    -self.config.association_residual_clip,
+                learned_residual = self._learned_association_residual_from_logits(
+                    logits,
+                    candidate_rows,
+                    candidate_cols,
+                    cost.shape,
                     self.config.association_residual_clip,
                 )
                 cost += self.config.association_cost_weight * learned_residual
@@ -934,18 +941,21 @@ class OCSORTTracker:
                 # fall back to the existing IoU/direction association instead.
                 # Explicit gate mode still handles non-finite values as invalid
                 # through ``invalid_mahalanobis_pairs`` above.
+                # Normalize and clamp the ranking term to [0, 1].  Therefore
+                # an arbitrarily distant, but IoU-valid, candidate can add at
+                # most mahalanobis_cost_coefficient to its association cost.
+                # The optional hard gate above still uses raw d^2 and is not
+                # weakened by this saturation.
                 mahalanobis_cost = np.where(
                     np.isfinite(mahalanobis_distances),
-                    mahalanobis_distances,
+                    np.clip(
+                        mahalanobis_distances / self.config.mahalanobis_cost_reference,
+                        0.0,
+                        1.0,
+                    ),
                     0.0,
                 )
-                # A fixed statistical reference keeps the cost coefficient
-                # interpretable when the optional gate threshold is swept.
-                cost += (
-                    self.config.mahalanobis_cost_coefficient
-                    * mahalanobis_cost
-                    / self.config.mahalanobis_cost_reference
-                )
+                cost += self.config.mahalanobis_cost_coefficient * mahalanobis_cost
 
         invalid_pairs = ~iou_valid_pairs
         invalid_pairs |= invalid_mahalanobis_pairs
@@ -1039,7 +1049,7 @@ class OCSORTTracker:
                 self.logger.info('mahalanobis_cost')
                 self.logger.info(f'{np.array2string(mahalanobis_cost)}')
             if learned_residual is not None:
-                self.logger.info('learned_association_residual')
+                self.logger.info('learned_association_softmax_residual')
                 self.logger.info(f'{np.array2string(learned_residual, precision=3, suppress_small=True)}')
             self.logger.info(f'speed_directions_cost')
             self.logger.info(f'{np.array2string(speed_directions_cost, precision=3, suppress_small=True)}')
@@ -1066,3 +1076,44 @@ class OCSORTTracker:
             matched_tracks,
         )
         return matched_tracks, unmatched_tracks, unmatched_detections
+    
+    @staticmethod
+    def _learned_association_residual_from_logits(
+        logits: np.ndarray,
+        candidate_rows: np.ndarray,
+        candidate_cols: np.ndarray,
+        shape: tuple[int, int],
+        residual_clip: float,
+    ) -> np.ndarray:
+        """Map listwise logits to a bounded, row-relative association cost.
+
+        Training groups candidates by source track and optimizes a softmax
+        ranking loss.  Absolute logits are therefore not calibrated across
+        rows; applying ``tanh(logit)`` directly can make every candidate look
+        bad when a whole row has a negative offset.  For each track, map its
+        valid candidates to probabilities and center around the uniform prior:
+
+            residual = 1 / candidate_count - softmax(logit)
+
+        A preferred candidate gets a negative (cost-reducing) residual, a less
+        likely candidate gets a positive residual, and each row sums to zero
+        before clipping.  Invalid IoU pairs retain a zero residual.
+        """
+        residual = np.zeros(shape, dtype=float)
+        if not len(candidate_rows) or residual_clip == 0:
+            return residual
+        logits = np.asarray(logits, dtype=float).reshape(-1)
+        if len(logits) != len(candidate_rows):
+            raise ValueError('one learned-association logit is required per candidate pair')
+        finite_logits = np.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+        for row in np.unique(candidate_rows):
+            positions = np.flatnonzero(candidate_rows == row)
+            row_logits = finite_logits[positions]
+            shifted = row_logits - np.max(row_logits)
+            exp_logits = np.exp(shifted)
+            probabilities = exp_logits / np.maximum(exp_logits.sum(), 1e-12)
+            centered = (1.0 / len(positions)) - probabilities
+            residual[row, candidate_cols[positions]] = np.clip(
+                centered, -residual_clip, residual_clip,
+            )
+        return residual
