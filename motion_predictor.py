@@ -102,6 +102,7 @@ def _load_adaptive_kalman(
         d_model=train_args.get('d_model', 256),
         dropout=train_args.get('dropout', 0.1),
         conf_alpha=train_args.get('conf_alpha', 2.0),
+        kalman_head_layers=train_args.get('kalman_head_layers', 3),
         max_gap_norm=(
             cfg.max_gap_norm
             if cfg.max_gap_norm is not None

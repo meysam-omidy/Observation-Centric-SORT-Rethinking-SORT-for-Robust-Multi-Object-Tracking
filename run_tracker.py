@@ -310,7 +310,7 @@ if __name__ == '__main__':
 
     p.add_argument('--max_age', type=int, default=30)
     p.add_argument('--update_window_start', type=int, default=30)
-    p.add_argument('--update_window_end', type=int, default=90)
+    p.add_argument('--update_window_end', type=int, default=50)
     p.add_argument('--min_box_area', type=int, default=100)
     p.add_argument('--max_aspect_ratio', type=float, default=1.6)
     p.add_argument('--delta_t', type=int, default=3)
@@ -348,7 +348,7 @@ if __name__ == '__main__':
                    help='absolute residual cap before association_cost_weight is applied')
     p.add_argument('--use_byte', action='store_true', default=True)
     p.add_argument('--no_use_byte', action='store_false', dest='use_byte')
-    p.add_argument('--use_oru', action='store_true', default=True,
+    p.add_argument('--use_oru', action='store_true', default=False,
                    help='OC-SORT Observation-Centric Re-Update: replay virtual observations through the KF on re-detection after a gap')
     p.add_argument('--no_use_oru', action='store_false', dest='use_oru')
     p.add_argument('--use_confidence_r', action='store_true', default=False,

@@ -171,8 +171,8 @@ class OCSORTTracker:
 
         if self.config.use_byte:
             remained_confirmed_tracks = select_indices(confirmed_tracks, unmatched_confirmed_track_indices)
-            remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking]]
-            # remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking, StateLost]]
+            # remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking]]
+            remained_tracking_tracks = [t for t in remained_confirmed_tracks if t.state in [StateTracking, StateLost]]
             matches, unmatched_remained_track_indices, unmatched_low_score_detection_indices = self.associate(
                 remained_tracking_tracks, 
                 low_confidence_detections, 

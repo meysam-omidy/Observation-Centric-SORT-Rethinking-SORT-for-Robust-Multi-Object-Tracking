@@ -38,13 +38,16 @@ def confidence_log_r_prior(
     return base_log_var + alpha * (1.0 - s)
 
 def nfc(n_layers, input_dim, output_dim, dropout):
-    components = []
+    if n_layers < 1:
+        raise ValueError("n_layers must be at least 1")
+    components = [nn.LayerNorm(input_dim)]
+    # components = []
     dims = torch.linspace(input_dim, output_dim, n_layers + 1)
     dims = [int(x) for x in dims]
     for i in range(len(dims) - 2):
         components.extend([
             nn.Linear(dims[i], dims[i+1]),
-            nn.LayerNorm(dims[i+1]),
+            # nn.LayerNorm(dims[i+1]),
             nn.GELU(),
             nn.Dropout(dropout * 0.5),
         ])
@@ -70,7 +73,14 @@ class PositionalEncoding(nn.Module):
 class _AdaptiveKalmanHead(nn.Module):
     """Shared Q/R output heads with confidence-R prior on R."""
 
-    def __init__(self, hidden_dim: int, dropout: float, conf_alpha: float = 2.0, q_init_bias: float = -12.0):
+    def __init__(
+        self,
+        hidden_dim: int,
+        dropout: float,
+        conf_alpha: float = 2.0,
+        q_init_bias: float = -12.0,
+        num_layers: int = 3,
+    ):
         super().__init__()
         self.conf_alpha = conf_alpha
         # Q head output is interpreted directly as log(var_q) by the loss.
@@ -80,26 +90,28 @@ class _AdaptiveKalmanHead(nn.Module):
         # direction and low-motion data is not stuck high early in training.
         
         self.q_head = nfc(
-            n_layers=3,
+            n_layers=num_layers,
             input_dim=hidden_dim + 1,
             output_dim=4,
             dropout=dropout * 0.5
         )
         self.r_residual_head = nfc(
-            n_layers=3,
+            n_layers=num_layers,
             input_dim=hidden_dim,
             output_dim=4,
             dropout=dropout * 0.5
         )
-        # self.q_head = nn.Linear(hidden_dim, 4)
-        # nn.init.constant_(self.q_head.bias, q_init_bias)
-        # nn.init.xavier_uniform_(self.q_head.weight, gain=0.1)
+        q_output = self.q_head[-1]
+        r_output = self.r_residual_head[-1]
+        if not isinstance(q_output, nn.Linear) or not isinstance(r_output, nn.Linear):
+            raise TypeError("adaptive Kalman heads must end in nn.Linear")
+        nn.init.constant_(q_output.bias, q_init_bias)
+        nn.init.xavier_uniform_(q_output.weight, gain=0.1)
         # Additive log-space delta on the confidence prior. Zero init → start at
         # prior; signed delta lets R go above or below the prior (unlike the old
         # prior_var + exp(logit) floor which froze loss_r when prior was too high).
-        # self.r_residual_head = nn.Linear(hidden_dim, 4)
-        # nn.init.zeros_(self.r_residual_head.weight)
-        # nn.init.zeros_(self.r_residual_head.bias)
+        nn.init.zeros_(r_output.weight)
+        nn.init.zeros_(r_output.bias)
 
     def predict_q(self, hidden: torch.Tensor, prediction_gap: torch.Tensor) -> torch.Tensor:
         return self.q_head(torch.cat([hidden, prediction_gap], dim=-1))
@@ -127,6 +139,7 @@ class AdaptiveKalmanTransformer(nn.Module):
         dropout: float = 0.1,
         conf_alpha: float = 2.0,
         max_gap_norm: float = 30.0,
+        kalman_head_layers: int = 3,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -154,7 +167,9 @@ class AdaptiveKalmanTransformer(nn.Module):
             num_layers=num_layers,
             norm=nn.LayerNorm(d_model),
         )
-        self.head = _AdaptiveKalmanHead(d_model, dropout, conf_alpha=conf_alpha)
+        self.head = _AdaptiveKalmanHead(
+            d_model, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers
+        )
 
     @staticmethod
     def _causal_mask(src_len: int, ctx_len: int, device: torch.device) -> torch.Tensor:
@@ -235,6 +250,7 @@ class AdaptiveKalmanLSTM(nn.Module):
         conf_alpha: float = 2.0,
         teacher_forcing_ratio: float = 0.5,
         max_gap_norm: float = 30.0,
+        kalman_head_layers: int = 3,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -260,7 +276,7 @@ class AdaptiveKalmanLSTM(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.head = _AdaptiveKalmanHead(
-            hidden_dim, dropout, conf_alpha=conf_alpha
+            hidden_dim, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers
         )
 
     @torch.no_grad()
