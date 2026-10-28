@@ -11,6 +11,7 @@ from motion_lstm import ImprovedLSTMPredictor
 from motion_transformer import MotionTransformer
 
 ADAPTIVE_KALMAN_FEATURE_DIM = 15
+ADAPTIVE_KALMAN_CONTEXT_FEATURE_DIM = 18
 
 
 class MotionPredictorConfig(BaseModel):
@@ -81,7 +82,7 @@ def build_model(cfg: MotionPredictorConfig, device: torch.device) -> torch.nn.Mo
 
 def _load_adaptive_kalman(
     cfg: MotionPredictorConfig, device: torch.device
-) -> tuple[torch.nn.Module, str, float, int]:
+) -> tuple[torch.nn.Module, str, float, int, int]:
     """
     Load a motion-predictor checkpoint (best_model.pth: model_state_dict + args) and
     rebuild the matching architecture — mirrors eval_adaptive_kalman.load_model_and_config
@@ -97,8 +98,12 @@ def _load_adaptive_kalman(
         )
     model_type = ckpt.get('model_type') or train_args.get('model_type', 'transformer')
 
+    feature_dim = int(ckpt.get('feature_dim', ADAPTIVE_KALMAN_FEATURE_DIM))
+    if feature_dim not in (ADAPTIVE_KALMAN_FEATURE_DIM, ADAPTIVE_KALMAN_CONTEXT_FEATURE_DIM):
+        raise ValueError(f'unsupported adaptive_kalman feature_dim {feature_dim}')
     model_kw = dict(
-        input_dim=ckpt.get('feature_dim', ADAPTIVE_KALMAN_FEATURE_DIM),
+        input_dim=feature_dim,
+        q_dim=int(ckpt.get('q_dim', train_args.get('q_dim', 4))),
         d_model=train_args.get('d_model', 256),
         dropout=train_args.get('dropout', 0.1),
         conf_alpha=train_args.get('conf_alpha', 2.0),
@@ -132,7 +137,7 @@ def _load_adaptive_kalman(
     history_len = int(ckpt.get('history_len', train_args.get('seq_in_len', 30)))
     if history_len < 2:
         raise ValueError('adaptive_kalman history_len must be at least 2')
-    return model, model_type, max_gap_norm, history_len
+    return model, model_type, max_gap_norm, history_len, feature_dim
 
 
 class MotionPredictorEngine:
@@ -151,7 +156,11 @@ class MotionPredictorEngine:
                 self.adaptive_model_type,
                 self.max_gap_norm,
                 self.history_len,
+                self.feature_dim,
             ) = _load_adaptive_kalman(cfg, self.device)
+            self.q_dim = self.model.head.q_dim
+            # 18-D checkpoints were trained with detection-context columns.
+            self.uses_detection_context = self.feature_dim == ADAPTIVE_KALMAN_CONTEXT_FEATURE_DIM
         else:
             self.model = build_model(cfg, self.device)
             self.model.load_weight(cfg.weights_path, map_location=str(self.device))

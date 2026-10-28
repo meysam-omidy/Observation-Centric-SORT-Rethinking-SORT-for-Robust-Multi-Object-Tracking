@@ -1,0 +1,18 @@
+{
+  "_comment": "Paper candidate (U3): one learned uncertainty for filtering, association and lifecycle. Starting values only - tune on the validation split, then ablate. Needs a retrained checkpoint (e.g. --objective innovation --q_dim 7).",
+  "model_type": "adaptive_kalman",
+  "weights_path": "../motion-predictor/checkpoints/paper_innovation_q7/best_model.pth",
+  "kalman_fusion_blend": 0.0,
+  "use_oru": false,
+  "batch_measurement_noise": true,
+  "use_mahalanobis_cost": true,
+  "mahalanobis_cost_coefficient": 0.3,
+  "learned_r_in_association": true,
+  "mahalanobis_include_logdet": true,
+  "association_box_expansion_sigma": 1.0,
+  "max_position_uncertainty": 1.0,
+  "uncertainty_max_age": 90,
+  "suppress_duplicate_track_births": true,
+  "cleanup_duplicate_tracks": true,
+  "prioritize_mature_tracks": true
+}

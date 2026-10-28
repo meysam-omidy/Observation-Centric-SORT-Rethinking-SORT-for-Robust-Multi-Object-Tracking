@@ -1,0 +1,9 @@
+{
+  "_comment": "Thesis Method 2 (confidence-scaled R, no network).",
+  "motion_enabled": false,
+  "use_confidence_r": true,
+  "reupdate_type": "none",
+  "use_byte": true,
+  "use_oru": true,
+  "legacy_post_assignment_iou_gate": true
+}

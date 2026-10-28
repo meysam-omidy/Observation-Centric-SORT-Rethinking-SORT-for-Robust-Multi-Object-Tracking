@@ -80,9 +80,13 @@ class _AdaptiveKalmanHead(nn.Module):
         conf_alpha: float = 2.0,
         q_init_bias: float = -12.0,
         num_layers: int = 3,
+        q_dim: int = 4,
     ):
         super().__init__()
+        if q_dim not in (4, 7):
+            raise ValueError("q_dim must be 4 (xywh) or 7 (xywh + velocity)")
         self.conf_alpha = conf_alpha
+        self.q_dim = q_dim
         # Q head output is interpreted directly as log(var_q) by the loss.
         # Bias = -12 → exp(-12) ≈ 6e-6 at init: a mid-scale start that sits
         # between low-motion (MOT17 ~6e-7) and high-motion (DanceTrack ~6e-5)
@@ -92,7 +96,7 @@ class _AdaptiveKalmanHead(nn.Module):
         self.q_head = nfc(
             n_layers=num_layers,
             input_dim=hidden_dim + 1,
-            output_dim=4,
+            output_dim=q_dim,
             dropout=dropout * 0.5
         )
         self.r_residual_head = nfc(
@@ -140,6 +144,7 @@ class AdaptiveKalmanTransformer(nn.Module):
         conf_alpha: float = 2.0,
         max_gap_norm: float = 30.0,
         kalman_head_layers: int = 3,
+        q_dim: int = 4,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -168,7 +173,8 @@ class AdaptiveKalmanTransformer(nn.Module):
             norm=nn.LayerNorm(d_model),
         )
         self.head = _AdaptiveKalmanHead(
-            d_model, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers
+            d_model, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers,
+            q_dim=q_dim,
         )
 
     @staticmethod
@@ -251,6 +257,7 @@ class AdaptiveKalmanLSTM(nn.Module):
         teacher_forcing_ratio: float = 0.5,
         max_gap_norm: float = 30.0,
         kalman_head_layers: int = 3,
+        q_dim: int = 4,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -276,7 +283,8 @@ class AdaptiveKalmanLSTM(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.head = _AdaptiveKalmanHead(
-            hidden_dim, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers
+            hidden_dim, dropout, conf_alpha=conf_alpha, num_layers=kalman_head_layers,
+            q_dim=q_dim,
         )
 
     @torch.no_grad()

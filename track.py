@@ -21,12 +21,21 @@ class TrackConfig(BaseModel):
     use_confidence_r : bool = False
     q_scale : float = Field(default=1.0, gt=0)
     r_scale : float = Field(default=1.0, gt=0)
+    # False -> never use a learned R; the KF keeps its fixed R (ablation switch).
+    use_learned_r : bool = True
+    # Uncertainty-driven lifecycle (paper upgrade U3). When set, a lost track is
+    # deleted once its predicted position std, divided by its box diagonal,
+    # exceeds this value; max_age is then replaced by the larger hard cap below.
+    max_position_uncertainty : float | None = Field(default=None, gt=0)
+    uncertainty_max_age : int = Field(default=90, ge=1)
+    # Store innovation statistics of every KF update (calibration analysis).
+    record_innovations : bool = False
 
 
 class TrackHistoryItem:
     def __init__(self, bbox : BBOX, score: float, type : str = None,
                  var_q: np.ndarray = None, var_r: np.ndarray = None,
-                 observed: bool = True):
+                 observed: bool = True, context: np.ndarray = None):
         self.bbox = bbox
         self.score = float(score)
         self.type = type
@@ -35,6 +44,8 @@ class TrackHistoryItem:
         # True detection this frame vs. a predicted/interpolated fill-in — feeds the
         # adaptive Kalman motion model's frames_since_obs/is_observed features.
         self.observed = observed
+        # Optional detection-context features of the matched detection.
+        self.context = None if context is None else np.asarray(context, dtype=float)
 
     def __repr__(self):
         if self.type is not None:
@@ -92,6 +103,7 @@ class Track:
         self.logs = {
             'max_time_lost': 0
         }
+        self.innovation_records: list[dict] = []
         self.id = id
         if self.config.use_kalman:
             self.kf = create_sort_kalman(np.asarray(bbox, dtype=float), float(score),
@@ -192,11 +204,25 @@ class Track:
         OC-SORT re-update can insert virtual history entries after a gap.  They
         are useful for motion features, but must not make a recently observed
         track appear more established than it really is for lifecycle policy.
+        The count is cached until the update history changes size.
         """
-        return sum(
-            1 for item in self.history.update.values()
-            if item.observed
-        )
+        size = len(self.history.update)
+        cached = getattr(self, '_observation_count_cache', None)
+        if cached is None or cached[0] != size:
+            count = sum(1 for item in self.history.update.values() if item.observed)
+            cached = (size, count)
+            self._observation_count_cache = cached
+        return cached[1]
+
+    @property
+    def position_uncertainty(self) -> float:
+        """Predicted position std divided by the box diagonal (0 without a KF)."""
+        if self.kf is None:
+            return 0.0
+        w, h = np.asarray(self.bbox, dtype=float)[2:4]
+        diagonal = max(float(np.hypot(w, h)), 1.0)
+        variance = max(float(self.kf.P[0, 0]), 0.0) + max(float(self.kf.P[1, 1]), 0.0)
+        return float(np.sqrt(variance)) / diagonal
     
     @property
     def k_last_observation(self) -> np.ndarray:
@@ -220,8 +246,18 @@ class Track:
 
     @property
     def is_valid(self) -> bool:
+        if self.config.max_position_uncertainty is None:
+            too_old = self.age > self.config.max_age
+        else:
+            too_old = (
+                self.age > self.config.uncertainty_max_age
+                or (
+                    self.state == StateLost
+                    and self.position_uncertainty > self.config.max_position_uncertainty
+                )
+            )
         invalid_conditions = [
-            self.age > self.config.max_age,
+            too_old,
             self.state == StateUnconfirmed and self.age >= 2,
             np.any(self.bbox[2:] <= 0)
         ]   
@@ -259,6 +295,7 @@ class Track:
                 self.config.image_width,
                 self.config.image_height,
             )
+        self._last_process_noise = self.kf.Q if Q is None else Q
         self.kf.predict(Q=Q)
         z_nn = bbox_xywh_to_z(xywh)
         b = float(np.clip(self.config.kalman_fusion_blend, 0.0, 1.0))
@@ -278,42 +315,76 @@ class Track:
         if self.state == StateTracking and self.age >= 2:
             self.state = StateLost
         self.history.state[self.current_frame] = self.state.name
-            
+
+    def measurement_noise(self, bbox, score: float, var_r: np.ndarray = None) -> np.ndarray | None:
+        """The R matrix used for a detection; None means the KF's fixed R."""
+        if self.config.use_confidence_r:
+            # wbrt-style per-frame confidence R: overrides learned/fixed R.
+            R = np.eye(4)
+            R[2:, 2:] *= 10
+            R *= np.e ** (2 * (1 - float(score)))
+            return R
+        if not getattr(self.config, 'use_learned_r', True):
+            return None
+        if var_r is None:
+            # Backward-compatible fallback for older one-stage predictors.
+            pred_item = self.history.predict.get(self.current_frame)
+            var_r = pred_item.var_r if pred_item is not None else None
+        if var_r is None:
+            return None
+        return self.config.r_scale * learned_measurement_noise_matrix(
+            var_r,
+            BBOX.from_tlbr(bbox),
+            self.config.image_width,
+            self.config.image_height,
+        )
+
+    def _record_innovation(self, z: np.ndarray, R: np.ndarray, score: float) -> None:
+        H, x, P = self.kf.H, self.kf.x, self.kf.P
+        innovation = (z - H @ x).reshape(4)
+        S = H @ P @ H.T + R
+        try:
+            nis = float(innovation @ np.linalg.solve(S, innovation))
+        except np.linalg.LinAlgError:
+            nis = float('nan')
+        w, h = np.asarray(self.bbox, dtype=float)[2:4]
+        self.innovation_records.append({
+            'frame': int(self.current_frame),
+            'track_id': int(self.id),
+            'gap': int(self.age),
+            'score': float(score),
+            'nis': nis,
+            'innovation': innovation.tolist(),
+            'innovation_variance': np.diag(S).tolist(),
+            # filterpy's predict(Q=...) does not store Q, so use the last one passed.
+            'q_trace_xy': float(np.trace(getattr(self, '_last_process_noise', self.kf.Q)[:2, :2])),
+            'box_diagonal': float(np.hypot(w, h)),
+        })
+
     def update(self, 
                bbox : Union[list, np.ndarray], 
                score : float,
-               var_r: np.ndarray = None):
+               var_r: np.ndarray = None,
+               context: np.ndarray = None):
         require_reupdate = False
         if self.age > 1:
             require_reupdate = True
         self.history.update[self.current_frame] = TrackHistoryItem(
             BBOX.from_tlbr(bbox),
-            score
+            score,
+            context=context,
         )
+        if not hasattr(self, 'innovation_records'):
+            self.innovation_records = []
         if self.kf is not None:
             z = tlbr_to_z(bbox)
-            if self.config.use_confidence_r:
-                # wbrt-style per-frame confidence R: overrides learned/fixed R.
-                R = np.eye(4)
-                R[2:, 2:] *= 10
-                R *= np.e ** (2 * (1 - float(score)))
+            R = self.measurement_noise(bbox, score, var_r)
+            if getattr(self.config, 'record_innovations', False):
+                self._record_innovation(z, self.kf.R if R is None else R, score)
+            if R is not None:
                 self.kf.update(z, R=R)
             else:
-                pred_item = self.history.predict.get(self.current_frame)
-                if var_r is None:
-                    # Backward-compatible fallback for older one-stage predictors.
-                    var_r = pred_item.var_r if pred_item is not None else None
-                if var_r is not None:
-                    xywh_obs = BBOX.from_tlbr(bbox)
-                    R = self.config.r_scale * learned_measurement_noise_matrix(
-                        var_r,
-                        xywh_obs,
-                        self.config.image_width,
-                        self.config.image_height,
-                    )
-                    self.kf.update(z, R=R)
-                else:
-                    self.kf.update(z)
+                self.kf.update(z)
         self.logs['max_time_lost'] = max(self.age, self.logs['max_time_lost'])
         self.age = 0
         if self.state == StateUnconfirmed:

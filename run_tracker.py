@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import os
 import threading
 import time
@@ -135,6 +136,14 @@ def tracker_config(
         'mature_track_min_observations': args.mature_track_min_observations,
         'reupdate_type': args.reupdate_type,
         'reupdate_constant_weight': args.reupdate_constant_weight,
+        'batch_measurement_noise': getattr(args, 'batch_measurement_noise', False),
+        'use_learned_r': getattr(args, 'use_learned_r', True),
+        'learned_r_in_association': getattr(args, 'learned_r_in_association', False),
+        'mahalanobis_include_logdet': getattr(args, 'mahalanobis_include_logdet', False),
+        'association_box_expansion_sigma': getattr(args, 'association_box_expansion_sigma', 0.0),
+        'max_position_uncertainty': getattr(args, 'max_position_uncertainty', None),
+        'uncertainty_max_age': getattr(args, 'uncertainty_max_age', 90),
+        'record_innovations': getattr(args, 'record_innovations', False),
         'log_path': log_path,
         'motion': motion_config(args),
     }
@@ -175,6 +184,28 @@ def sequence_log_path(args, seq: str) -> str | None:
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     return path
+
+
+def load_config_defaults(parser: argparse.ArgumentParser, argv=None) -> str | None:
+    """Apply ``--config preset.json`` as parser defaults; explicit flags still win.
+
+    A preset maps argument names (dest form, e.g. ``use_mahalanobis_cost``) to
+    values. Unknown keys are rejected so a typo cannot silently do nothing.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config', type=str, default=None)
+    known, _ = pre.parse_known_args(argv)
+    if not known.config:
+        return None
+    with open(known.config, encoding='utf-8') as file:
+        preset = json.load(file)
+    preset = {key: value for key, value in preset.items() if not key.startswith('_')}
+    valid = {action.dest for action in parser._actions}
+    unknown = sorted(set(preset) - valid)
+    if unknown:
+        parser.error(f'unknown keys in {known.config}: {unknown}')
+    parser.set_defaults(**preset)
+    return known.config
 
 
 def run(seq: str, args, motion_engine=None, association_engine=None) -> None:
@@ -274,7 +305,10 @@ def main(args) -> None:
                 # Propagate worker failures and do not evaluate partial output.
                 future.result()
 
-    if args.evaluate:
+    if args.evaluate and args.split == 'test':
+        print('test split has no public ground truth; skipping evaluation '
+              '(use make_submission.py to package the outputs)')
+    elif args.evaluate:
         print('evaluating...')
         evaluate(
             args.dataset, args.split,
@@ -286,7 +320,10 @@ def main(args) -> None:
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description='Run OC-SORT with the adaptive Kalman Q/R motion model')
 
-    p.add_argument('--dataset', type=str, default='DanceTrack', choices=['MOT17', 'MOT20', 'DanceTrack'])
+    p.add_argument('--config', type=str, default=None,
+                   help='JSON preset of argument defaults (see configs/); explicit flags override it')
+    p.add_argument('--dataset', type=str, default='DanceTrack',
+                   choices=['MOT17', 'MOT20', 'DanceTrack', 'SportsMOT'])
     p.add_argument('--split', type=str, default='val')
     # p.add_argument('--seqs', type=str, nargs='*', default=['dancetrack0026', 'dancetrack0034', 'dancetrack0041', 'dancetrack0043', 'dancetrack0081', 'dancetrack0094'], help='specific sequence names; default = whole split')
     p.add_argument('--seqs', type=str, nargs='*', default=None, help='specific sequence names; default = whole split')
@@ -407,6 +444,25 @@ if __name__ == '__main__':
         '--mature_track_min_observations', type=int, default=3,
         help='real detector updates required for phase-1 mature-track priority',
     )
+    # ---- paper-update options (defaults reproduce the thesis) ----
+    p.add_argument('--batch_measurement_noise', action='store_true', default=False,
+                   help='one batched learned-R call per frame after all association phases (same results, faster)')
+    p.add_argument('--use_learned_r', action='store_true', default=True,
+                   help="use the model's R head for measurement noise")
+    p.add_argument('--no_use_learned_r', action='store_false', dest='use_learned_r',
+                   help="ignore the model's R head; keep the KF's fixed R (ablation)")
+    p.add_argument('--learned_r_in_association', action='store_true', default=False,
+                   help='use the learned R of each candidate in the Mahalanobis innovation covariance')
+    p.add_argument('--mahalanobis_include_logdet', action='store_true', default=False,
+                   help='rank candidates by Gaussian likelihood (adds row-relative log|S| to the distance)')
+    p.add_argument('--association_box_expansion_sigma', type=float, default=0.0,
+                   help='enlarge predicted boxes by k predicted-position std before IoU (0 = off)')
+    p.add_argument('--max_position_uncertainty', type=float, default=None,
+                   help='delete a lost track when position std / box diagonal exceeds this (replaces max_age)')
+    p.add_argument('--uncertainty_max_age', type=int, default=90,
+                   help='hard age cap used together with --max_position_uncertainty')
+    p.add_argument('--record_innovations', action='store_true', default=False,
+                   help='keep per-update innovation statistics (used by analyze_calibration.py)')
     p.add_argument('--reupdate_type', type=str, default=None, choices=['constant', 'relative', 'none'])
     p.add_argument('--reupdate_constant_weight', type=float, default=0.8)
 
@@ -433,6 +489,7 @@ if __name__ == '__main__':
         help='adaptive_kalman only; None = read from checkpoint (falls back to 30.0)',
     )
 
+    load_config_defaults(p)
     args = p.parse_args()
     if args.sequence_workers < 1:
         p.error('--sequence_workers must be at least 1')

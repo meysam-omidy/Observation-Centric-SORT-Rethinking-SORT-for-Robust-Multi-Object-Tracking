@@ -107,12 +107,23 @@ def learned_process_noise_matrix(
     image_height: float,
     vel_floor: float = 0.01,
 ) -> np.ndarray:
-    """7x7 diagonal Q: learned xywh motion uncertainty mapped to (x,y,s,r) + small velocity floors."""
-    d = _var_xywh_norm_to_z_diag(var_q_norm, xywh_px, image_width, image_height)
-    q = np.array(
-        [d[0], d[1], d[2], d[3], vel_floor, vel_floor, vel_floor],
-        dtype=float,
-    )
+    """7x7 diagonal Q: learned xywh motion uncertainty mapped to (x,y,s,r).
+
+    A 4-vector (thesis model) keeps small fixed velocity noise. A 7-vector also
+    carries learned velocity variances (vx, vy, vs) in normalized z units
+    (x/W, y/H, s/(W*H)); they are scaled to pixels here so a maneuver can raise
+    velocity uncertainty instead of only inflating position noise.
+    """
+    var_q_norm = np.asarray(var_q_norm, dtype=float).reshape(-1)
+    d = _var_xywh_norm_to_z_diag(var_q_norm[:4], xywh_px, image_width, image_height)
+    if len(var_q_norm) == 7:
+        iw, ih = float(image_width), float(image_height)
+        velocity = np.maximum(var_q_norm[4:], 1e-8) * np.array([iw ** 2, ih ** 2, (iw * ih) ** 2])
+    elif len(var_q_norm) == 4:
+        velocity = np.full(3, vel_floor, dtype=float)
+    else:
+        raise ValueError(f'learned Q must have 4 or 7 variances, got {len(var_q_norm)}')
+    q = np.concatenate([d, velocity])
     return np.diag(np.maximum(q, 1e-8))
 
 

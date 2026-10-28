@@ -1,0 +1,8 @@
+{
+  "_comment": "Thesis Method 1 (direct transformer box prediction), as in run_benchmark_matrix.py.",
+  "model_type": "transformer",
+  "weights_path": "motion_model_weights/transformer-encoder-d256-ff512-6l-ft.pth",
+  "use_oru": true,
+  "legacy_post_assignment_iou_gate": true,
+  "reupdate_type": "relative"
+}

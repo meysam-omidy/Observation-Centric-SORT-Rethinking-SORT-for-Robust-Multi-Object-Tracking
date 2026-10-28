@@ -1,0 +1,17 @@
+{
+  "_comment": "Thesis final method, exactly as benchmarked. batch_measurement_noise is output-identical and only faster.",
+  "model_type": "adaptive_kalman",
+  "weights_path": "../motion-predictor/checkpoints/kf_adaptive_kalman_real_low_data_lightvv_transformer_newarch_kftrackoff/best_model.pth",
+  "kalman_fusion_blend": 0.0,
+  "legacy_post_assignment_iou_gate": true,
+  "use_mahalanobis_cost": true,
+  "mahalanobis_cost_coefficient": 0.1,
+  "use_learned_association": true,
+  "association_weights_path": "checkpoints/association_multidataset_v2/best_model.pth",
+  "association_cost_weight": 1.0,
+  "suppress_duplicate_track_births": true,
+  "cleanup_duplicate_tracks": true,
+  "prioritize_mature_tracks": true,
+  "use_oru": false,
+  "batch_measurement_noise": true
+}

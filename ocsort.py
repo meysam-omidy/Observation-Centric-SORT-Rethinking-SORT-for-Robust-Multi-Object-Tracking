@@ -2,8 +2,10 @@ from track import Track
 from track_state import TrackState, StateUnconfirmed, StateTracking, StateLost, StateDeleted
 from utils import (
     select_indices, batch_iou, batch_speed_direction, assignment, compute_motion_features,
-    compute_adaptive_kalman_features, get_dict_item, tlbr_to_z, BBOX,
+    compute_adaptive_kalman_features, compute_detection_context, get_dict_item,
+    tlbr_to_z, BBOX, DETECTION_CONTEXT_DIM, ADAPTIVE_KALMAN_FEATURE_DIM,
 )
+from kalman_filter import learned_measurement_noise_matrix
 from pydantic import BaseModel, Field
 from motion_predictor import MotionPredictorConfig, MotionPredictorEngine
 from association_model import AssociationScorerEngine, build_pair_features
@@ -84,6 +86,25 @@ class OCSORTTrackerConfig(BaseModel):
     # Debug-only, per-frame association matrices. Kept disabled during normal
     # tracking so no extra matrix copies or memory traffic are incurred.
     collect_association_diagnostics : bool = False
+    # ---- paper-update options (all off by default = thesis behaviour) ----
+    # Compute learned R for every match of a frame in ONE network call after all
+    # association phases (phases touch disjoint tracks, so results are the same).
+    batch_measurement_noise : bool = False
+    # False -> ignore the model's R head; the KF keeps its fixed R (ablation).
+    use_learned_r : bool = True
+    # Use the learned R of each candidate detection in the innovation covariance
+    # S = HPH^T + R for the Mahalanobis cost/gate (and reuse it for the update).
+    learned_r_in_association : bool = False
+    # Add the row-relative log|S| to the Mahalanobis cost, i.e. rank candidates by
+    # Gaussian likelihood instead of distance alone. Needs a candidate-specific R.
+    mahalanobis_include_logdet : bool = False
+    # Enlarge each predicted box by k predicted-position std before IoU (0 = off).
+    association_box_expansion_sigma : float = Field(default=0.0, ge=0)
+    # Uncertainty-driven lifecycle, see TrackConfig.max_position_uncertainty.
+    max_position_uncertainty : float | None = Field(default=None, gt=0)
+    uncertainty_max_age : int = Field(default=90, ge=1)
+    # Keep per-update innovation statistics on each track (calibration study).
+    record_innovations : bool = False
     log_path : str | None = None
     reupdate_type : Literal['constant', 'relative', None] = None
     reupdate_constant_weight : float = 1
@@ -100,6 +121,9 @@ class OCSORTTracker:
         self.last_association_diagnostics: list[dict] = []
         self._duplicate_overlap_streaks: dict[tuple[int, int], int] = {}
         self._pending_duplicate_track_deletions: set[int] = set()
+        self._pending_updates: list[tuple] = []
+        self._candidate_var_r: dict[tuple[int, int], np.ndarray] = {}
+        self._frame_context: np.ndarray | None = None
         self.motion_engine = motion_engine
         self.association_engine = association_engine
         if self.config.motion.enabled and self.motion_engine is None:
@@ -141,6 +165,7 @@ class OCSORTTracker:
         # update. Retaining only the current frame prevents a diagnostic run
         # from accumulating every dense association matrix in tracker memory.
         self.last_association_diagnostics = []
+        self._candidate_var_r = {}
 
         if self.config.log_path:
             text = f'FRAME {self.frame_number}'
@@ -159,6 +184,12 @@ class OCSORTTracker:
         high_scores = boxes[high_mask][:, 4]
         low_confidence_detections = boxes[low_mask][:, :4]
         low_scores = boxes[low_mask][:, 4]
+        frame_context = None
+        if self._uses_detection_context:
+            frame_context = compute_detection_context(
+                boxes[:, :4], self.config.image_width, self.config.image_height
+            )
+        self._frame_context = frame_context
         confirmed_tracks = self.get_tracks([StateTracking, StateLost])   
         matches, unmatched_confirmed_track_indices, unmatched_high_confidence_detection_indices = self._associate_confirmed_tracks(
             confirmed_tracks, 
@@ -171,7 +202,8 @@ class OCSORTTracker:
             association_observer=association_observer,
         )
         self._update_matches(
-            confirmed_tracks, high_confidence_detections, high_scores, matches
+            confirmed_tracks, high_confidence_detections, high_scores, matches,
+            detection_indices=high_detection_indices,
         )
 
         if self.config.use_byte:
@@ -189,7 +221,8 @@ class OCSORTTracker:
                 association_observer=association_observer,
             )
             self._update_matches(
-                remained_tracking_tracks, low_confidence_detections, low_scores, matches
+                remained_tracking_tracks, low_confidence_detections, low_scores, matches,
+                detection_indices=low_detection_indices,
             )
 
         remained_high_confidence_detections = select_indices(high_confidence_detections, unmatched_high_confidence_detection_indices)
@@ -213,7 +246,9 @@ class OCSORTTracker:
             remained_high_confidence_detections,
             remained_high_scores,
             matches,
+            detection_indices=np.asarray(remained_high_detection_indices, dtype=int),
         )
+        self._flush_pending_updates()
 
         # Observe duplicate candidates only after every association phase has
         # consumed this frame.  Deletion is deferred to the next frame so a
@@ -439,8 +474,31 @@ class OCSORTTracker:
             and self.motion_engine.cfg.model_type == 'adaptive_kalman'
         )
 
+    @property
+    def _uses_detection_context(self) -> bool:
+        return bool(
+            getattr(self.motion_engine, 'uses_detection_context', False)
+            and self._use_adaptive_kalman
+        )
+
     def _adaptive_context(self, track):
-        """Fixed-size completed-frame context matching training exactly."""
+        """Fixed-size completed-frame context matching training exactly.
+
+        Q and R ask for the same window within a frame, so it is cached per frame.
+        """
+        history = getattr(track, 'history', None)
+        if history is None or not hasattr(self, 'frame_number'):
+            return self._build_adaptive_context(track)
+        key = (self.frame_number, track.current_frame, len(history.update),
+               len(history.predict))
+        cached = getattr(track, '_adaptive_context_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        context = self._build_adaptive_context(track)
+        track._adaptive_context_cache = (key, context)
+        return context
+
+    def _build_adaptive_context(self, track):
         history_len = self.motion_engine.history_len
         items = (
             track.history_items(history_len)
@@ -458,58 +516,118 @@ class OCSORTTracker:
         )
         scores = np.asarray([item.score for item in items], dtype=float)
         observed = np.asarray([item.observed for item in items], dtype=bool)
+        detection_context = None
+        if self._uses_detection_context:
+            detection_context = np.zeros((len(items), DETECTION_CONTEXT_DIM), dtype=float)
+            for row, item in enumerate(items):
+                if getattr(item, 'context', None) is not None:
+                    detection_context[row] = item.context
         features = compute_adaptive_kalman_features(
-            boxes, scores, observed, self.motion_engine.max_gap_norm
+            boxes, scores, observed, self.motion_engine.max_gap_norm, context=detection_context
         )
         return boxes, scores, observed, features
 
-    def _measurement_feature(self, context, detection, score):
-        boxes, scores, observed, _ = context
+    def _measurement_feature(self, context, detection, score, detection_context=None):
+        boxes, scores, observed, features = context
+        # Context columns are kept on observed rows and zero elsewhere, which is
+        # exactly what the builder needs to reproduce them for the extended window.
+        history_context = (
+            features[:, -DETECTION_CONTEXT_DIM:]
+            if features.shape[1] > ADAPTIVE_KALMAN_FEATURE_DIM else None
+        )
         current = np.asarray(BBOX.from_tlbr(detection), dtype=float)
         current /= np.array(
             [self.config.image_width, self.config.image_height,
              self.config.image_width, self.config.image_height],
             dtype=float,
         )
+        context_window = None
+        if history_context is not None:
+            current_context = (
+                np.zeros(DETECTION_CONTEXT_DIM) if detection_context is None
+                else np.asarray(detection_context, dtype=float).reshape(DETECTION_CONTEXT_DIM)
+            )
+            context_window = np.concatenate([history_context, current_context[None]], axis=0)
         ext = compute_adaptive_kalman_features(
             np.concatenate([boxes, current[None]], axis=0),
             np.concatenate([scores, [float(score)]]),
             np.concatenate([observed, [True]]),
             self.motion_engine.max_gap_norm,
+            context=context_window,
         )
         return ext[-1]
 
-    def _update_matches(self, tracks, detections, scores, matches):
-        """Condition R on each matched current detection, then perform KF update."""
-        var_rs = [None] * len(matches)
-        if self._use_adaptive_kalman and not self.config.use_confidence_r and matches:
-            rows, measurements, valid_positions = [], [], []
-            for pos, (t_i, d_i) in enumerate(matches):
-                context = self._adaptive_context(tracks[t_i])
-                if context is None:
-                    continue
-                rows.append(context[3])
-                measurements.append(
-                    self._measurement_feature(
-                        context, detections[d_i], float(scores[d_i])
-                    )
-                )
-                valid_positions.append(pos)
-            if rows:
-                batched = np.stack(rows).astype(np.float32, copy=False)
-                lens = [self.motion_engine.history_len] * len(rows)
-                predicted = self.motion_engine.predict_r_batch(
-                    batched, lens, np.stack(measurements)
-                ).cpu().numpy()
-                for pos, var_r in zip(valid_positions, predicted):
-                    var_rs[pos] = var_r
+    def _detection_context_row(self, detection_index):
+        if self._frame_context is None or detection_index is None:
+            return None
+        return self._frame_context[int(detection_index)]
 
-        for pos, (t_i, d_i) in enumerate(matches):
-            tracks[t_i].update(
-                detections[d_i],
-                score=float(scores[d_i]),
-                var_r=var_rs[pos],
+    def _predict_var_r(self, requests):
+        """One batched R call for [(track, detection, score, context_row), ...]."""
+        var_rs = [None] * len(requests)
+        if not (
+            self._use_adaptive_kalman
+            and self.config.use_learned_r
+            and not self.config.use_confidence_r
+            and requests
+        ):
+            return var_rs
+        rows, measurements, valid_positions = [], [], []
+        for pos, (track, detection, score, detection_context) in enumerate(requests):
+            context = self._adaptive_context(track)
+            if context is None:
+                continue
+            rows.append(context[3])
+            measurements.append(
+                self._measurement_feature(context, detection, float(score), detection_context)
             )
+            valid_positions.append(pos)
+        if rows:
+            batched = np.stack(rows).astype(np.float32, copy=False)
+            lens = [self.motion_engine.history_len] * len(rows)
+            predicted = self.motion_engine.predict_r_batch(
+                batched, lens, np.stack(measurements)
+            ).cpu().numpy()
+            for pos, var_r in zip(valid_positions, predicted):
+                var_rs[pos] = var_r
+        return var_rs
+
+    def _update_matches(self, tracks, detections, scores, matches, detection_indices=None):
+        """Condition R on each matched current detection, then perform KF update."""
+        if detection_indices is None:
+            detection_indices = [None] * len(detections)
+        jobs = []
+        for t_i, d_i in matches:
+            global_index = detection_indices[d_i]
+            jobs.append((
+                tracks[t_i], detections[d_i], float(scores[d_i]),
+                self._detection_context_row(global_index), global_index,
+            ))
+        self._pending_updates.extend(jobs)
+        if not self.config.batch_measurement_noise:
+            self._flush_pending_updates()
+
+    def _flush_pending_updates(self):
+        jobs, self._pending_updates = self._pending_updates, []
+        if not jobs:
+            return
+        var_rs = [None] * len(jobs)
+        missing = []
+        for pos, (track, _, _, _, global_index) in enumerate(jobs):
+            cached = self._candidate_var_r.get((track.id, global_index))
+            if cached is not None:
+                var_rs[pos] = cached
+            else:
+                missing.append(pos)
+        predicted = self._predict_var_r([jobs[pos][:4] for pos in missing])
+        for pos, var_r in zip(missing, predicted):
+            var_rs[pos] = var_r
+        for (track, detection, score, detection_context, _), var_r in zip(jobs, var_rs):
+            track.update(detection, score=score, var_r=var_r, context=detection_context)
+
+    def innovation_records(self) -> list[dict]:
+        """All recorded KF innovations (needs record_innovations=True)."""
+        return [record for track in self.tracks for record in track.innovation_records]
 
     def predict_tracks(self):
         self.frame_number += 1
@@ -870,6 +988,7 @@ class OCSORTTracker:
         track_speed_directions = np.array([t.speed_direction for t in tracks])
         track_speed_directions = track_speed_directions.repeat(len(detections)).reshape(-1, len(detections))
         track_tlbrs = np.array([t.bbox.to_tlbr() for t in tracks])
+        association_tlbrs = self._expanded_track_boxes(tracks, track_tlbrs)
         track_previous_obs = np.array([t.k_last_observation for t in tracks])
         speed_directions = batch_speed_direction(track_previous_obs, detections)
         speed_directions_cost = np.abs(speed_directions - track_speed_directions)
@@ -880,7 +999,11 @@ class OCSORTTracker:
         speed_direction_coefficient_matrix = np.ones_like(speed_directions_cost) * self.config.association_speed_direction_coefficient
         speed_direction_coefficient_matrix = np.where(mask, np.zeros_like(speed_directions_cost), speed_direction_coefficient_matrix)
 
-        iou_cost = 1 - batch_iou(track_tlbrs, detections)
+        plain_iou = batch_iou(track_tlbrs, detections)
+        iou_cost = (
+            1 - plain_iou if association_tlbrs is track_tlbrs
+            else 1 - batch_iou(association_tlbrs, detections)
+        )
         iou_valid_pairs = (1 - iou_cost) > iou_threshold
         cost = self.config.association_iou_coefficient * iou_cost + speed_direction_coefficient_matrix * speed_directions_cost
         learned_residual = None
@@ -888,7 +1011,7 @@ class OCSORTTracker:
             # Score only pairs that have passed the existing IoU gate. Invalid
             # cells retain their original sentinel cost below.
             learned_features = build_pair_features(
-                tracks, detections, scores, 1 - iou_cost, speed_directions_cost,
+                tracks, detections, scores, plain_iou, speed_directions_cost,
                 self.config.image_width, self.config.image_height,
             )
             learned_residual = np.zeros_like(cost)
@@ -917,11 +1040,17 @@ class OCSORTTracker:
             or self.config.use_mahalanobis_gate
         )
         mahalanobis_distances = None
+        mahalanobis_logdet = None
         invalid_mahalanobis_pairs = np.zeros_like(iou_cost, dtype=bool)
         if use_mahalanobis_cost or use_mahalanobis_gate:
-            mahalanobis_distances = self._mahalanobis_distances(
-                tracks, detections, scores, iou_valid_pairs
-            )
+            if self._use_learned_candidate_r:
+                mahalanobis_distances, mahalanobis_logdet = self._learned_r_mahalanobis(
+                    tracks, detections, scores, iou_valid_pairs, detection_indices
+                )
+            else:
+                mahalanobis_distances = self._mahalanobis_distances(
+                    tracks, detections, scores, iou_valid_pairs
+                )
             if use_mahalanobis_gate:
                 valid_mahalanobis_pairs = iou_valid_pairs & (
                     mahalanobis_distances <= self.config.mahalanobis_gate_threshold
@@ -946,10 +1075,15 @@ class OCSORTTracker:
                 # most mahalanobis_cost_coefficient to its association cost.
                 # The optional hard gate above still uses raw d^2 and is not
                 # weakened by this saturation.
+                ranking_distance = mahalanobis_distances
+                if self.config.mahalanobis_include_logdet and mahalanobis_logdet is not None:
+                    ranking_distance = mahalanobis_distances + self._row_relative(
+                        mahalanobis_logdet, iou_valid_pairs
+                    )
                 mahalanobis_cost = np.where(
-                    np.isfinite(mahalanobis_distances),
+                    np.isfinite(ranking_distance),
                     np.clip(
-                        mahalanobis_distances / self.config.mahalanobis_cost_reference,
+                        ranking_distance / self.config.mahalanobis_cost_reference,
                         0.0,
                         1.0,
                     ),
@@ -1077,6 +1211,90 @@ class OCSORTTracker:
         )
         return matched_tracks, unmatched_tracks, unmatched_detections
     
+    @property
+    def _use_learned_candidate_r(self) -> bool:
+        return bool(
+            self.config.learned_r_in_association
+            and self._use_adaptive_kalman
+            and self.config.use_learned_r
+            and not self.config.use_confidence_r
+        )
+
+    @staticmethod
+    def _row_relative(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        """Subtract each row's minimum over valid finite cells (others -> 0)."""
+        out = np.zeros_like(values, dtype=float)
+        usable = valid & np.isfinite(values)
+        for row in np.flatnonzero(usable.any(axis=1)):
+            columns = usable[row]
+            out[row, columns] = values[row, columns] - values[row, columns].min()
+        return out
+
+    def _expanded_track_boxes(self, tracks, track_tlbrs: np.ndarray) -> np.ndarray:
+        """Predicted boxes enlarged by k * predicted-position std (k = 0 -> unchanged)."""
+        k = self.config.association_box_expansion_sigma
+        if k <= 0:
+            return track_tlbrs
+        expanded = np.array(track_tlbrs, dtype=float, copy=True)
+        for row, track in enumerate(tracks):
+            if track.kf is None:
+                continue
+            sigma_x = np.sqrt(max(float(track.kf.P[0, 0]), 0.0))
+            sigma_y = np.sqrt(max(float(track.kf.P[1, 1]), 0.0))
+            expanded[row] += k * np.array([-sigma_x, -sigma_y, sigma_x, sigma_y])
+        return expanded
+
+    def _learned_r_mahalanobis(
+        self,
+        tracks: list[Track],
+        detections: np.ndarray,
+        scores: np.ndarray,
+        candidate_mask: np.ndarray,
+        detection_indices: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Squared distance and log|S| with S = HPH^T + R(candidate) for every
+        valid candidate, in one batched R call. The R of each candidate is cached
+        so the eventual KF update reuses it instead of calling the network again.
+        Tracks without a full history window fall back to their fixed KF R.
+        """
+        distances = np.full((len(tracks), len(detections)), np.nan, dtype=float)
+        logdets = np.full_like(distances, np.nan)
+        rows, cols = np.nonzero(candidate_mask)
+        if not len(rows):
+            return distances, logdets
+        requests = [
+            (tracks[r], detections[c], float(scores[c]),
+             self._detection_context_row(detection_indices[c]))
+            for r, c in zip(rows, cols)
+        ]
+        var_rs = self._predict_var_r(requests)
+        for (r, c), var_r in zip(zip(rows, cols), var_rs):
+            track = tracks[r]
+            kf = track.kf
+            if kf is None:
+                distances[r, c] = 0.0
+                logdets[r, c] = 0.0
+                continue
+            if var_r is None:
+                R = kf.R
+            else:
+                self._candidate_var_r[(track.id, int(detection_indices[c]))] = var_r
+                R = track.config.r_scale * learned_measurement_noise_matrix(
+                    var_r, BBOX.from_tlbr(detections[c]),
+                    self.config.image_width, self.config.image_height,
+                )
+            S = kf.H @ kf.P @ kf.H.T + R
+            S = 0.5 * (S + S.T) + np.eye(4) * 1e-6
+            innovation = tlbr_to_z(detections[c]).reshape(4) - (kf.H @ kf.x).reshape(4)
+            try:
+                sign, logdet = np.linalg.slogdet(S)
+                d2 = float(innovation @ np.linalg.solve(S, innovation))
+            except np.linalg.LinAlgError:
+                sign, logdet, d2 = -1.0, np.nan, np.inf
+            distances[r, c] = d2 if np.isfinite(d2) and d2 >= 0 else np.inf
+            logdets[r, c] = logdet if sign > 0 else np.nan
+        return distances, logdets
+
     @staticmethod
     def _learned_association_residual_from_logits(
         logits: np.ndarray,
